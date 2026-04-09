@@ -1,10 +1,11 @@
 import os
+import json
 import torch
 import numpy as np
 import pandas as pd
 
 from scipy import io
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import Dataset
 from Models.interpretable_diffusion.model_utils import normalize_to_neg_one_to_one, unnormalize_to_zero_to_one
 from Utils.masking_utils import noise_mask
@@ -19,6 +20,7 @@ class CustomDataset(Dataset):
         proportion=0.8, 
         save2npy=True, 
         neg_one_to_one=True,
+        normalization='minmax',
         seed=123,
         period='train',
         output_dir='./OUTPUT',
@@ -32,9 +34,11 @@ class CustomDataset(Dataset):
         assert period in ['train', 'test'], 'period must be train or test.'
         if period == 'train':
             assert ~(predict_length is not None or missing_ratio is not None), ''
+        assert normalization in ['minmax', 'zscore'], 'normalization must be minmax or zscore.'
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
-        self.rawdata, self.scaler = self.read_data(data_root, self.name)
+        self.normalization = normalization
+        self.rawdata, self.scaler = self.read_data(data_root, self.name, normalization)
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
 
@@ -42,7 +46,7 @@ class CustomDataset(Dataset):
         self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
         self.sample_num_total = max(self.len - self.window + 1, 0)
         self.save2npy = save2npy
-        self.auto_norm = neg_one_to_one
+        self.auto_norm = neg_one_to_one and self.normalization == 'minmax'
 
         self.data = self.__normalize(self.rawdata)
         train, inference = self.__getsamples(self.data, proportion, seed)
@@ -127,14 +131,14 @@ class CustomDataset(Dataset):
         return regular_data, irregular_data
 
     @staticmethod
-    def read_data(filepath, name=''):
+    def read_data(filepath, name='', normalization='minmax'):
         """Reads a single .csv
         """
         df = pd.read_csv(filepath, header=0)
         if name == 'etth':
             df.drop(df.columns[0], axis=1, inplace=True)
         data = df.values
-        scaler = MinMaxScaler()
+        scaler = MinMaxScaler() if normalization == 'minmax' else StandardScaler()
         scaler = scaler.fit(data)
         return data, scaler
     
@@ -169,6 +173,246 @@ class CustomDataset(Dataset):
         return self.sample_num
     
 
+class SubjectSplitCSVDataset(Dataset):
+    def __init__(
+        self,
+        name,
+        data_root,
+        window=64,
+        proportion=0.8,
+        save2npy=True,
+        neg_one_to_one=True,
+        normalization='minmax',
+        seed=123,
+        period='train',
+        output_dir='./OUTPUT',
+        predict_length=None,
+        missing_ratio=None,
+        style='separate',
+        distribution='geometric',
+        mean_mask_length=3,
+        subject_train_ratio=0.8,
+        subject_val_ratio=0.1,
+        subject_test_ratio=0.1,
+        subject_shuffle=True,
+        file_pattern='.csv',
+        max_subjects=None,
+        drop_nan_subjects=False
+    ):
+        super(SubjectSplitCSVDataset, self).__init__()
+        assert period in ['train', 'val', 'test'], 'period must be train, val or test.'
+        if period == 'train':
+            assert ~(predict_length is not None or missing_ratio is not None), ''
+        assert normalization in ['minmax', 'zscore'], 'normalization must be minmax or zscore.'
+        ratios = np.array([subject_train_ratio, subject_val_ratio, subject_test_ratio], dtype=np.float64)
+        assert np.isclose(ratios.sum(), 1.0), 'subject split ratios must sum to 1.0.'
+
+        self.name = name
+        self.pred_len = predict_length
+        self.missing_ratio = missing_ratio
+        self.style = style
+        self.distribution = distribution
+        self.mean_mask_length = mean_mask_length
+        self.normalization = normalization
+        self.window = window
+        self.period = period
+        self.save2npy = save2npy
+        self.auto_norm = neg_one_to_one and self.normalization == 'minmax'
+        self.dir = os.path.join(output_dir, 'samples')
+        os.makedirs(self.dir, exist_ok=True)
+
+        subject_files = self._list_subject_files(data_root, file_pattern)
+        subject_files, excluded_nan_files = self._filter_nan_subjects(subject_files, drop_nan_subjects)
+        subject_files = self._limit_subjects(
+            subject_files,
+            seed=seed,
+            max_subjects=max_subjects,
+            shuffle=subject_shuffle,
+        )
+        split_subjects = self._split_subjects(
+            subject_files,
+            seed=seed,
+            train_ratio=subject_train_ratio,
+            val_ratio=subject_val_ratio,
+            shuffle=subject_shuffle,
+        )
+        self.subject_files = split_subjects[period]
+        self._save_split_manifest(split_subjects, excluded_nan_files)
+
+        self.raw_windows, self.samples, self.sample_subjects = self._build_windows(self.subject_files)
+        self.sample_num = self.samples.shape[0]
+        self.var_num = self.samples.shape[-1] if self.sample_num > 0 else 0
+
+        if self.save2npy:
+            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_{self.period}.npy"), self.raw_windows)
+            if self.auto_norm:
+                np.save(
+                    os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_{self.period}.npy"),
+                    unnormalize_to_zero_to_one(self.samples)
+                )
+            else:
+                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_{self.period}.npy"), self.samples)
+
+        if period in ['val', 'test'] and missing_ratio is not None:
+            self.masking = self.mask_data(seed)
+        elif period in ['val', 'test'] and predict_length is not None:
+            masks = np.ones(self.samples.shape)
+            masks[:, -predict_length:, :] = 0
+            self.masking = masks.astype(bool)
+
+    @staticmethod
+    def _list_subject_files(data_root, file_pattern):
+        if not os.path.isdir(data_root):
+            raise ValueError(f"Expected subject directory for subject split mode, got: {data_root}")
+        files = [
+            os.path.join(data_root, f)
+            for f in sorted(os.listdir(data_root))
+            if f.endswith(file_pattern)
+        ]
+        if len(files) == 0:
+            raise ValueError(f"No subject files matching '*{file_pattern}' found in {data_root}")
+        return files
+
+    @classmethod
+    def _filter_nan_subjects(cls, subject_files, drop_nan_subjects):
+        if not drop_nan_subjects:
+            return subject_files, []
+
+        valid_files = []
+        excluded_files = []
+        for filepath in subject_files:
+            data = cls._read_subject_csv(filepath)
+            if np.isnan(data).any():
+                excluded_files.append(filepath)
+            else:
+                valid_files.append(filepath)
+
+        if len(valid_files) == 0:
+            raise ValueError('All subject files were excluded because they contain NaN values.')
+        return valid_files, excluded_files
+
+    @staticmethod
+    def _limit_subjects(subject_files, seed, max_subjects=None, shuffle=True):
+        if max_subjects is None:
+            return subject_files
+        max_subjects = int(max_subjects)
+        if max_subjects <= 0 or len(subject_files) <= max_subjects:
+            return subject_files
+
+        indices = np.arange(len(subject_files))
+        st0 = np.random.get_state()
+        np.random.seed(seed)
+        if shuffle:
+            indices = np.random.permutation(indices)
+        np.random.set_state(st0)
+        selected = np.sort(indices[:max_subjects])
+        return [subject_files[idx] for idx in selected]
+
+    @staticmethod
+    def _split_subjects(subject_files, seed, train_ratio, val_ratio, shuffle=True):
+        num_subjects = len(subject_files)
+        indices = np.arange(num_subjects)
+        st0 = np.random.get_state()
+        np.random.seed(seed)
+        if shuffle:
+            indices = np.random.permutation(indices)
+        np.random.set_state(st0)
+
+        train_end = int(np.floor(num_subjects * train_ratio))
+        val_end = train_end + int(np.floor(num_subjects * val_ratio))
+        if num_subjects >= 3:
+            train_end = max(train_end, 1)
+            val_end = max(val_end, train_end + 1)
+            val_end = min(val_end, num_subjects - 1)
+
+        split_indices = {
+            'train': indices[:train_end],
+            'val': indices[train_end:val_end],
+            'test': indices[val_end:],
+        }
+        return {
+            split: [subject_files[idx] for idx in split_ids]
+            for split, split_ids in split_indices.items()
+        }
+
+    def _save_split_manifest(self, split_subjects, excluded_nan_files=None):
+        if not self.save2npy:
+            return
+        manifest = {
+            split: [os.path.basename(path) for path in paths]
+            for split, paths in split_subjects.items()
+        }
+        manifest['excluded_nan_subjects'] = [] if excluded_nan_files is None else [
+            os.path.basename(path) for path in excluded_nan_files
+        ]
+        manifest_path = os.path.join(self.dir, f"{self.name}_subject_split_manifest.json")
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+    @staticmethod
+    def _read_subject_csv(filepath, name=''):
+        df = pd.read_csv(filepath, header=0)
+        if name == 'etth':
+            df.drop(df.columns[0], axis=1, inplace=True)
+        return df.values
+
+    def _build_windows(self, subject_files):
+        raw_windows = []
+        norm_windows = []
+        sample_subjects = []
+
+        for filepath in subject_files:
+            rawdata = self._read_subject_csv(filepath, self.name)
+            scaler = MinMaxScaler() if self.normalization == 'minmax' else StandardScaler()
+            scaler = scaler.fit(rawdata)
+            data = scaler.transform(rawdata)
+            if self.auto_norm:
+                data = normalize_to_neg_one_to_one(data)
+
+            sample_num_total = max(rawdata.shape[0] - self.window + 1, 0)
+            for i in range(sample_num_total):
+                start = i
+                end = i + self.window
+                raw_windows.append(rawdata[start:end, :])
+                norm_windows.append(data[start:end, :])
+                sample_subjects.append(os.path.basename(filepath))
+
+        if len(norm_windows) == 0:
+            raise ValueError(
+                f"No windows created for split '{self.period}'. "
+                f"Check subject counts and window length={self.window}."
+            )
+
+        return np.asarray(raw_windows), np.asarray(norm_windows), sample_subjects
+
+    def mask_data(self, seed=2023):
+        masks = np.ones_like(self.samples)
+        st0 = np.random.get_state()
+        np.random.seed(seed)
+
+        for idx in range(self.samples.shape[0]):
+            x = self.samples[idx, :, :]
+            mask = noise_mask(x, self.missing_ratio, self.mean_mask_length, self.style, self.distribution)
+            masks[idx, :, :] = mask
+
+        if self.save2npy:
+            np.save(os.path.join(self.dir, f"{self.name}_masking_{self.window}_{self.period}.npy"), masks)
+
+        np.random.set_state(st0)
+        return masks.astype(bool)
+
+    def __getitem__(self, ind):
+        if hasattr(self, 'masking'):
+            x = self.samples[ind, :, :]
+            m = self.masking[ind, :, :]
+            return torch.from_numpy(x).float(), torch.from_numpy(m)
+        x = self.samples[ind, :, :]
+        return torch.from_numpy(x).float()
+
+    def __len__(self):
+        return self.sample_num
+
+
 class fMRIDataset(CustomDataset):
     def __init__(
         self, 
@@ -178,10 +422,10 @@ class fMRIDataset(CustomDataset):
         super().__init__(proportion=proportion, **kwargs)
 
     @staticmethod
-    def read_data(filepath, name=''):
+    def read_data(filepath, name='', normalization='minmax'):
         """Reads a single .csv
         """
         data = io.loadmat(filepath + '/sim4.mat')['ts']
-        scaler = MinMaxScaler()
+        scaler = MinMaxScaler() if normalization == 'minmax' else StandardScaler()
         scaler = scaler.fit(data)
         return data, scaler

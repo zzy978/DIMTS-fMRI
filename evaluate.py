@@ -1,7 +1,7 @@
 import numpy as np
 
-pred = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood_zscore/ddpm_predict_fmri_seq256_pred128_ood_zscore.npy')
-gt = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood_zscore/samples/fmri_norm_truth_256_test.npy')
+pred = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood/ddpm_predict_fmri_seq256_pred128_ood.npy')
+gt = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood/samples/fmri_ground_truth_256_test.npy')
 
 pred_len = 128   # 改成你实际预测长度
 
@@ -23,7 +23,7 @@ print('gt_future shape:', gt_future.shape)
 print(f'MAE  = {mae:.6f}')
 print(f'MSE  = {mse:.6f}')
 print(f'RMSE = {rmse:.6f}')
-# print(f'MAPE = {mape:.4f}%')
+print(f'MAPE = {mape:.4f}%')
 
 print("-"*30)
 
@@ -43,5 +43,4 @@ plt.plot(pred[sample_id, :, feature_id], label='Prediction')
 plt.axvline(gt.shape[1] - pred_len - 1, color='r', linestyle='--', label='Prediction Start')
 plt.legend()
 # plt.show()
-plt.savefig('fmri_pred128_ood_prediction_vs_gt_zscore_sample100.png')
-
+plt.savefig('111fmri_pred256_subjects_prediction_vs_gt_minmax_sample100.png')

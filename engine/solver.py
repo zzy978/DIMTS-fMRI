@@ -22,15 +22,16 @@ def cycle(dl):
 
 
 class Trainer(object):
-    def __init__(self, config, args, model, dataloader, logger=None):
+    def __init__(self, config, args, model, dataloader=None, logger=None, val_dataloader=None):
         super().__init__()
         self.model = model
         self.device = self.model.betas.device
         self.train_num_steps = config['solver']['max_epochs']
         self.gradient_accumulate_every = config['solver']['gradient_accumulate_every']
         self.save_cycle = config['solver']['save_cycle']
-        self.dl = cycle(dataloader['dataloader'])
-        self.dataloader = dataloader['dataloader']
+        self.dl = None if dataloader is None else cycle(dataloader['dataloader'])
+        self.dataloader = None if dataloader is None else dataloader['dataloader']
+        self.val_dataloader = None if val_dataloader is None else val_dataloader['dataloader']
         self.step = 0
         self.milestone = 0
         self.args, self.config = args, config
@@ -53,6 +54,27 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
+
+    def evaluate(self):
+        if self.val_dataloader is None:
+            return None
+
+        self.model.eval()
+        total_loss = 0.0
+        total_batches = 0
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                if isinstance(batch, (list, tuple)):
+                    batch = batch[0]
+                batch = batch.to(self.device)
+                loss = self.model(batch, target=batch)
+                total_loss += loss.item()
+                total_batches += 1
+        self.model.train()
+
+        if total_batches == 0:
+            return None
+        return total_loss / total_batches
 
     def save(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -95,6 +117,8 @@ class Trainer(object):
         self.milestone_classifier = milestone
 
     def train(self):
+        if self.dl is None:
+            raise ValueError('Training requested without a training dataloader.')
         device = self.device
         step = 0
         if self.logger is not None:
@@ -136,6 +160,18 @@ class Trainer(object):
                         # info += ' | Total Loss: {:.6f}'.format(total_loss)
                         # self.logger.log_info(info)
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        val_loss = self.evaluate()
+                        if val_loss is not None:
+                            self.logger.add_scalar(tag='val/loss', scalar_value=val_loss, global_step=self.step)
+                            self.logger.log_info(
+                                f'{self.args.name}: step {self.step}/{self.train_num_steps} | '
+                                f'train_loss={total_loss:.6f} | val_loss={val_loss:.6f}'
+                            )
+                        else:
+                            self.logger.log_info(
+                                f'{self.args.name}: step {self.step}/{self.train_num_steps} | '
+                                f'train_loss={total_loss:.6f}'
+                            )
 
                 pbar.update(1)
 
@@ -187,6 +223,102 @@ class Trainer(object):
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
         return samples, reals, masks
         # return samples
+
+    def restore_sequence(self, target_window, partial_mask, coef=1e-1, stepsize=1e-1, sampling_steps=50):
+        if target_window.ndim != 2 or partial_mask.ndim != 2:
+            raise ValueError('target_window and partial_mask must both be 2D arrays shaped [seq_len, feature_dim].')
+        if target_window.shape != partial_mask.shape:
+            raise ValueError('target_window and partial_mask must have the same shape.')
+
+        model_kwargs = {
+            'coef': coef,
+            'learning_rate': stepsize,
+        }
+        x = torch.from_numpy(target_window).float().unsqueeze(0).to(self.device)
+        t_m = torch.from_numpy(partial_mask.astype(bool)).to(self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            if sampling_steps == self.model.num_timesteps:
+                sample = self.ema.ema_model.sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                )
+            else:
+                sample = self.ema.ema_model.fast_sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                    sampling_timesteps=sampling_steps,
+                )
+        return sample[0].detach().cpu().numpy()
+
+    def extend_sequence(
+        self,
+        normalized_sequence,
+        total_extend_len,
+        pred_len,
+        coef=1e-1,
+        stepsize=1e-1,
+        sampling_steps=50,
+        autoregressive=False,
+    ):
+        if normalized_sequence.ndim != 2:
+            raise ValueError('normalized_sequence must be shaped [time, feature_dim].')
+        seq_length = self.model.seq_length
+        feature_dim = normalized_sequence.shape[1]
+
+        if pred_len <= 0:
+            raise ValueError('pred_len must be positive for sequence extension.')
+        if pred_len >= seq_length:
+            raise ValueError('pred_len must be smaller than the model seq_length for extension.')
+        if total_extend_len <= 0:
+            raise ValueError('total_extend_len must be positive.')
+        if not autoregressive and total_extend_len > pred_len:
+            raise ValueError('Without autoregressive mode, total_extend_len cannot exceed pred_len.')
+
+        current_sequence = normalized_sequence.astype(np.float32).copy()
+        generated_chunks = []
+        window_records = []
+        remaining = total_extend_len
+
+        while remaining > 0:
+            current_chunk_len = min(pred_len, remaining) if autoregressive else total_extend_len
+            context_len = seq_length - current_chunk_len
+            if current_sequence.shape[0] < context_len:
+                raise ValueError(
+                    f'Input sequence length {current_sequence.shape[0]} is shorter than required context length {context_len}.'
+                )
+
+            target_window = np.zeros((seq_length, feature_dim), dtype=np.float32)
+            partial_mask = np.zeros((seq_length, feature_dim), dtype=bool)
+            context_window = current_sequence[-context_len:, :]
+            target_window[:context_len, :] = context_window
+            partial_mask[:context_len, :] = True
+
+            restored_window = self.restore_sequence(
+                target_window=target_window,
+                partial_mask=partial_mask,
+                coef=coef,
+                stepsize=stepsize,
+                sampling_steps=sampling_steps,
+            )
+            generated_chunk = restored_window[-current_chunk_len:, :]
+            current_sequence = np.concatenate([current_sequence, generated_chunk], axis=0)
+            generated_chunks.append(generated_chunk)
+            window_records.append(restored_window)
+            remaining -= current_chunk_len
+
+            if not autoregressive:
+                break
+
+        return {
+            'extended_sequence': current_sequence,
+            'generated_extension': np.concatenate(generated_chunks, axis=0),
+            'restored_windows': np.stack(window_records, axis=0),
+        }
 
     def forward_sample(self, x_start):
        b, c, h = x_start.shape
@@ -246,4 +378,3 @@ class Trainer(object):
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
         # return classifier
-
