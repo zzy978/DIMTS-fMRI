@@ -130,6 +130,42 @@ def compute_extension_metrics(history_raw, extension_raw, compare_len=None):
     return metrics
 
 
+def compute_prediction_metrics(pred, gt, pred_len, eps=1e-8):
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+    if pred.shape != gt.shape:
+        raise ValueError(f'pred and gt must have the same shape, got {pred.shape} and {gt.shape}.')
+    if pred.ndim != 3:
+        raise ValueError(f'Expected pred and gt shaped [batch, seq_len, feature_dim], got {pred.shape}.')
+    if pred_len <= 0 or pred_len > pred.shape[1]:
+        raise ValueError(f'pred_len must be in [1, {pred.shape[1]}], got {pred_len}.')
+
+    pred_future = pred[:, -pred_len:, :]
+    gt_future = gt[:, -pred_len:, :]
+    err = pred_future - gt_future
+
+    fc_corrs = []
+    psd_l1s = []
+    for pred_sample, gt_sample in zip(pred_future, gt_future):
+        fc_corrs.append(_safe_corrcoef(_connectivity_upper(gt_sample), _connectivity_upper(pred_sample)))
+        psd_l1s.append(float(np.mean(np.abs(_normalized_psd(gt_sample) - _normalized_psd(pred_sample)))))
+
+    metrics = {
+        'num_samples': int(pred.shape[0]),
+        'seq_len': int(pred.shape[1]),
+        'pred_len': int(pred_len),
+        'mae': float(np.mean(np.abs(err))),
+        'mse': float(np.mean(err ** 2)),
+        'rmse': float(np.sqrt(np.mean(err ** 2))),
+        'mape': float(np.mean(np.abs(err) / (np.abs(gt_future) + eps)) * 100.0),
+        'future_mean_shift_mae': float(np.mean(np.abs(pred_future.mean(axis=1) - gt_future.mean(axis=1)))),
+        'future_std_shift_mae': float(np.mean(np.abs(pred_future.std(axis=1) - gt_future.std(axis=1)))),
+        'fc_upper_corr': float(np.mean(fc_corrs)) if len(fc_corrs) > 0 else 0.0,
+        'psd_l1': float(np.mean(psd_l1s)) if len(psd_l1s) > 0 else 0.0,
+    }
+    return metrics
+
+
 def save_metrics(metrics, output_path):
     with open(output_path, 'w') as f:
         json.dump(metrics, f, indent=2)

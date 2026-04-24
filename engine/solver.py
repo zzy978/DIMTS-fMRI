@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -36,6 +37,9 @@ class Trainer(object):
         self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
+        self.best_val_loss = None
+        self.best_val_step = None
+        self.loaded_checkpoint_meta = None
 
         self.results_folder = Path(config['solver']['results_folder'] + f'_{model.seq_length}')
         os.makedirs(self.results_folder, exist_ok=True)
@@ -76,16 +80,72 @@ class Trainer(object):
             return None
         return total_loss / total_batches
 
-    def save(self, milestone, verbose=False):
-        if self.logger is not None and verbose:
-            self.logger.log_info('Save current model to {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
+    def _checkpoint_state(self):
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
             'ema': self.ema.state_dict(),
             'opt': self.opt.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'best_val_step': self.best_val_step,
         }
-        torch.save(data, str(self.results_folder / f'checkpoint-{milestone}.pt'))
+        return data
+
+    def save(self, milestone, verbose=False, filename=None):
+        checkpoint_path = self.results_folder / (filename if filename is not None else f'checkpoint-{milestone}.pt')
+        if self.logger is not None and verbose:
+            self.logger.log_info('Save current model to {}'.format(str(checkpoint_path)))
+        data = self._checkpoint_state()
+        torch.save(data, str(checkpoint_path))
+
+    def save_best(self, verbose=False):
+        self.save(milestone='best', verbose=verbose, filename='best.pt')
+
+    def save_training_summary(self):
+        summary = {
+            'experiment_name': self.args.name,
+            'seq_len': int(self.model.seq_length),
+            'stride': int(self.config['dataloader']['train_dataset']['params'].get('stride', 1)),
+            'normalization': self.config['dataloader']['train_dataset']['params'].get('normalization'),
+            'max_subjects': self.config['dataloader']['train_dataset']['params'].get('max_subjects'),
+            'l_loss': self.config['model']['params'].get('l_loss'),
+            'mmd_alpha': self.config['model']['params'].get('mmd_alpha'),
+            'train_steps': int(self.step),
+            'best_val_loss': self.best_val_loss,
+            'best_val_step': self.best_val_step,
+            'results_folder': str(self.results_folder),
+        }
+        if self.dataloader is not None:
+            summary['train_dataset_size'] = int(len(self.dataloader.dataset))
+        if self.val_dataloader is not None:
+            summary['val_dataset_size'] = int(len(self.val_dataloader.dataset))
+        with open(os.path.join(self.args.save_dir, 'training_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+
+    def load(self, milestone, verbose=False):
+        if milestone == 'best':
+            checkpoint_path = self.results_folder / 'best.pt'
+        else:
+            checkpoint_path = self.results_folder / f'checkpoint-{milestone}.pt'
+        if self.logger is not None and verbose:
+            self.logger.log_info('Resume from {}'.format(str(checkpoint_path)))
+        device = self.device
+        data = torch.load(str(checkpoint_path), map_location=device)
+        self.model.load_state_dict(data['model'])
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        self.ema.load_state_dict(data['ema'])
+        self.best_val_loss = data.get('best_val_loss')
+        self.best_val_step = data.get('best_val_step')
+        self.milestone = milestone if isinstance(milestone, int) else self.milestone
+        self.loaded_checkpoint_meta = {
+            'checkpoint_ref': milestone,
+            'step': data.get('step'),
+            'best_val_loss': data.get('best_val_loss'),
+            'best_val_step': data.get('best_val_step'),
+            'path': str(checkpoint_path),
+        }
+        return data
     
     def save_classifier(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -95,17 +155,6 @@ class Trainer(object):
             'classifier': self.classifier.state_dict()
         }
         torch.save(data, str(self.results_folder / f'ckpt_classfier-{milestone}.pt'))
-
-    def load(self, milestone, verbose=False):
-        if self.logger is not None and verbose:
-            self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
-        device = self.device
-        data = torch.load(str(self.results_folder / f'checkpoint-{milestone}.pt'), map_location=device)
-        self.model.load_state_dict(data['model'])
-        self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        self.ema.load_state_dict(data['ema'])
-        self.milestone = milestone
 
     def load_classifier(self, milestone, verbose=False):
         if self.logger is not None and verbose:
@@ -162,6 +211,10 @@ class Trainer(object):
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
                         val_loss = self.evaluate()
                         if val_loss is not None:
+                            if self.best_val_loss is None or val_loss < self.best_val_loss:
+                                self.best_val_loss = float(val_loss)
+                                self.best_val_step = int(self.step)
+                                self.save_best(verbose=True)
                             self.logger.add_scalar(tag='val/loss', scalar_value=val_loss, global_step=self.step)
                             self.logger.log_info(
                                 f'{self.args.name}: step {self.step}/{self.train_num_steps} | '
@@ -178,6 +231,7 @@ class Trainer(object):
         print('training complete')
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
+        self.save_training_summary()
 
     def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
         if self.logger is not None:

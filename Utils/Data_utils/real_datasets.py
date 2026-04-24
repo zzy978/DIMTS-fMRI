@@ -17,6 +17,7 @@ class CustomDataset(Dataset):
         name,
         data_root, 
         window=64, 
+        stride=1,
         proportion=0.8, 
         save2npy=True, 
         neg_one_to_one=True,
@@ -43,8 +44,9 @@ class CustomDataset(Dataset):
         os.makedirs(self.dir, exist_ok=True)
 
         self.window, self.period = window, period
+        self.stride = stride
         self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
-        self.sample_num_total = max(self.len - self.window + 1, 0)
+        self.sample_num_total = self._num_windows(self.len, self.window, self.stride)
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one and self.normalization == 'minmax'
 
@@ -65,10 +67,8 @@ class CustomDataset(Dataset):
 
     def __getsamples(self, data, proportion, seed):
         x = np.zeros((self.sample_num_total, self.window, self.var_num))
-        for i in range(self.sample_num_total):
-            start = i
-            end = i + self.window
-            x[i, :, :] = data[start:end, :]
+        for i, start in enumerate(self._window_starts(self.len, self.window, self.stride)):
+            x[i, :, :] = data[start:start + self.window, :]
 
         train_data, test_data = self.divide(x, proportion, seed)
 
@@ -110,6 +110,18 @@ class CustomDataset(Dataset):
         x = data
         return self.scaler.inverse_transform(x)
     
+    @staticmethod
+    def _window_starts(length, window, stride):
+        if stride <= 0:
+            raise ValueError('stride must be a positive integer.')
+        if length < window:
+            return []
+        return list(range(0, length - window + 1, stride))
+
+    @classmethod
+    def _num_windows(cls, length, window, stride):
+        return len(cls._window_starts(length, window, stride))
+
     @staticmethod
     def divide(data, ratio, seed=2023):
         size = data.shape[0]
@@ -179,6 +191,7 @@ class SubjectSplitCSVDataset(Dataset):
         name,
         data_root,
         window=64,
+        stride=1,
         proportion=0.8,
         save2npy=True,
         neg_one_to_one=True,
@@ -215,9 +228,11 @@ class SubjectSplitCSVDataset(Dataset):
         self.mean_mask_length = mean_mask_length
         self.normalization = normalization
         self.window = window
+        self.stride = stride
         self.period = period
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one and self.normalization == 'minmax'
+        self.max_subjects = max_subjects
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
 
@@ -229,6 +244,7 @@ class SubjectSplitCSVDataset(Dataset):
             max_subjects=max_subjects,
             shuffle=subject_shuffle,
         )
+        self.selected_subject_pool = subject_files
         split_subjects = self._split_subjects(
             subject_files,
             seed=seed,
@@ -342,12 +358,25 @@ class SubjectSplitCSVDataset(Dataset):
             split: [os.path.basename(path) for path in paths]
             for split, paths in split_subjects.items()
         }
+        manifest['num_subjects_per_split'] = {
+            split: len(paths) for split, paths in split_subjects.items()
+        }
+        manifest['selected_subjects'] = [os.path.basename(path) for path in self.selected_subject_pool]
         manifest['excluded_nan_subjects'] = [] if excluded_nan_files is None else [
             os.path.basename(path) for path in excluded_nan_files
         ]
+        manifest['window'] = self.window
+        manifest['stride'] = self.stride
+        manifest['max_subjects'] = self.max_subjects
+        manifest['period'] = self.period
         manifest_path = os.path.join(self.dir, f"{self.name}_subject_split_manifest.json")
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
+
+        for split, paths in split_subjects.items():
+            filenames = [os.path.splitext(os.path.basename(path))[0] for path in paths]
+            info_path = os.path.join(self.dir, f"{split}_info.csv")
+            pd.DataFrame(filenames).to_csv(info_path, index=False, header=False)
 
     @staticmethod
     def _read_subject_csv(filepath, name=''):
@@ -369,10 +398,9 @@ class SubjectSplitCSVDataset(Dataset):
             if self.auto_norm:
                 data = normalize_to_neg_one_to_one(data)
 
-            sample_num_total = max(rawdata.shape[0] - self.window + 1, 0)
-            for i in range(sample_num_total):
-                start = i
-                end = i + self.window
+            starts = CustomDataset._window_starts(rawdata.shape[0], self.window, self.stride)
+            for start in starts:
+                end = start + self.window
                 raw_windows.append(rawdata[start:end, :])
                 norm_windows.append(data[start:end, :])
                 sample_subjects.append(os.path.basename(filepath))

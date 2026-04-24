@@ -1,46 +1,53 @@
-import numpy as np
-
-pred = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood/ddpm_predict_fmri_seq256_pred128_ood.npy')
-gt = np.load('/data/home/zyzeng/project/DiMTS/OUTPUT/fmri_seq256_pred128_ood/samples/fmri_ground_truth_256_test.npy')
-
-pred_len = 128   # 改成你实际预测长度
-
-pred_future = pred[:, -pred_len:, :]
-gt_future = gt[:, -pred_len:, :]
-
-err = pred_future - gt_future
-
-mae = np.mean(np.abs(err))
-mse = np.mean(err ** 2)
-rmse = np.sqrt(mse)
-
-# 避免除零
-eps = 1e-8
-mape = np.mean(np.abs(err) / (np.abs(gt_future) + eps)) * 100
-
-print('pred_future shape:', pred_future.shape)
-print('gt_future shape:', gt_future.shape)
-print(f'MAE  = {mae:.6f}')
-print(f'MSE  = {mse:.6f}')
-print(f'RMSE = {rmse:.6f}')
-print(f'MAPE = {mape:.4f}%')
-
-print("-"*30)
-
-mae_per_dim = np.mean(np.abs(err), axis=(0, 1))
-rmse_per_dim = np.sqrt(np.mean(err ** 2, axis=(0, 1)))
-
-# print('MAE per dim:', mae_per_dim)
-# print('RMSE per dim:', rmse_per_dim)
+import argparse
+import json
+import os
 
 import matplotlib.pyplot as plt
+import numpy as np
 
-sample_id = 100
-feature_id = 200
+from Utils.extension_utils import compute_prediction_metrics
 
-plt.plot(gt[sample_id, :, feature_id], label='Ground Truth')
-plt.plot(pred[sample_id, :, feature_id], label='Prediction')
-plt.axvline(gt.shape[1] - pred_len - 1, color='r', linestyle='--', label='Prediction Start')
-plt.legend()
-# plt.show()
-plt.savefig('111fmri_pred256_subjects_prediction_vs_gt_minmax_sample100.png')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Evaluate predict-mode outputs.')
+    parser.add_argument('--pred', type=str, required=True, help='Path to prediction array (.npy).')
+    parser.add_argument('--gt', type=str, required=True, help='Path to ground-truth array (.npy).')
+    parser.add_argument('--pred_len', type=int, required=True, help='Prediction horizon length.')
+    parser.add_argument('--output_json', type=str, default=None, help='Optional path to save metrics JSON.')
+    parser.add_argument('--plot_path', type=str, default=None, help='Optional path to save one prediction-vs-ground-truth plot.')
+    parser.add_argument('--sample_id', type=int, default=0, help='Sample index for the optional plot.')
+    parser.add_argument('--feature_id', type=int, default=0, help='Feature index for the optional plot.')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    pred = np.load(args.pred)
+    gt = np.load(args.gt)
+
+    metrics = compute_prediction_metrics(pred, gt, args.pred_len)
+    print(json.dumps(metrics, indent=2))
+
+    if args.output_json is not None:
+        output_dir = os.path.dirname(args.output_json)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(args.output_json, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f'saved metrics to {args.output_json}')
+
+    if args.plot_path is not None:
+        os.makedirs(os.path.dirname(args.plot_path) or '.', exist_ok=True)
+        pred_seq = pred[args.sample_id, :, args.feature_id]
+        gt_seq = gt[args.sample_id, :, args.feature_id]
+        plt.plot(gt_seq, label='Ground Truth')
+        plt.plot(pred_seq, label='Prediction')
+        plt.axvline(gt.shape[1] - args.pred_len - 1, color='r', linestyle='--', label='Prediction Start')
+        plt.legend()
+        plt.savefig(args.plot_path)
+        plt.close()
+        print(f'saved plot to {args.plot_path}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,5 +1,6 @@
 import os
 import copy
+import json
 import torch
 import argparse
 import numpy as np
@@ -11,6 +12,7 @@ from Models.interpretable_diffusion.model_utils import unnormalize_to_zero_to_on
 from Utils.io_utils import load_yaml_config, seed_everything, merge_opts_to_config, instantiate_from_config
 from Utils.extension_utils import (
     compute_extension_metrics,
+    compute_prediction_metrics,
     fit_sequence_scaler,
     inverse_normalize_sequence,
     load_raw_sequence,
@@ -51,6 +53,16 @@ def parse_args():
 
     parser.add_argument('--missing_ratio', type=float, default=0.1, help='Ratio of Missing Values.') # 只在 mode=infill 时有意义。表示要人为遮掉多少比例的数据点，然后让模型补全
     parser.add_argument('--pred_len', type=int, default=0, help='Length of Predictions.') # 只在 mode=predict 时有意义。表示要预测未来多少个时间步。
+    parser.add_argument('--stride', type=int, default=None,
+                        help='Sliding window stride for dataset window extraction.')
+    parser.add_argument('--lambda1', type=float, default=None,
+                        help='Override Fourier loss weight, mapped to model.params.l_loss.')
+    parser.add_argument('--lambda2', type=float, default=None,
+                        help='Override channel correlation loss weight, mapped to model.params.mmd_alpha.')
+    parser.add_argument('--use_best_checkpoint', action='store_true', default=False,
+                        help='Use best.pt for sample/predict/extend instead of checkpoint-<milestone>.pt.')
+    parser.add_argument('--checkpoint_name', type=str, default=None,
+                        help='Optional checkpoint subdirectory name under solver.results_folder for experiment isolation.')
     parser.add_argument('--norm_method', type=str, default='minmax',
                         choices=['minmax', 'zscore'],
                         help='Normalization method for dataset preprocessing.')
@@ -77,6 +89,8 @@ def parse_args():
                         help='Total number of future timepoints to generate for sequence extension.')
     parser.add_argument('--autoregressive', action='store_true', default=False,
                         help='Use iterative autoregressive continuation for sequence extension.')
+    parser.add_argument('--extend_zscore_only', action='store_true', default=False,
+                        help='For sequence extension only, use per-ROI z-score directly as model input/output without minmax or inverse transform.')
     
     # args for modify config
     parser.add_argument('opts', help='Modify config options using the command-line',
@@ -98,8 +112,17 @@ def main():
     
     config = load_yaml_config(args.config_file)
     config = merge_opts_to_config(config, args.opts)
+    if args.checkpoint_name is not None:
+        config['solver']['results_folder'] = os.path.join(config['solver']['results_folder'], args.checkpoint_name)
     config['dataloader']['train_dataset']['params']['normalization'] = args.norm_method
     config['dataloader']['test_dataset']['params']['normalization'] = args.norm_method
+    if args.lambda1 is not None:
+        config['model']['params']['l_loss'] = args.lambda1
+    if args.lambda2 is not None:
+        config['model']['params']['mmd_alpha'] = args.lambda2
+    if args.stride is not None:
+        config['dataloader']['train_dataset']['params']['stride'] = args.stride
+        config['dataloader']['test_dataset']['params']['stride'] = args.stride
     if args.data_input_mode == 'subject_split':
         split_target = 'Utils.Data_utils.real_datasets.SubjectSplitCSVDataset'
         subject_root = config['dataloader']['train_dataset']['params']['data_root']
@@ -124,6 +147,8 @@ def main():
             params['subject_shuffle'] = args.subject_shuffle
             params['max_subjects'] = None if args.max_subjects <= 0 else args.max_subjects
             params['drop_nan_subjects'] = args.drop_nan_subjects
+            if args.stride is not None:
+                params['stride'] = args.stride
 
     logger = Logger(args)
     logger.save_config(config)
@@ -146,7 +171,8 @@ def main():
         if args.pred_len <= 0:
             raise ValueError('Please provide a positive --pred_len for sequence extension.')
 
-        trainer.load(args.milestone)
+        checkpoint_ref = 'best' if args.use_best_checkpoint else args.milestone
+        trainer.load(checkpoint_ref)
         dataset_name = config['dataloader']['train_dataset']['params'].get('name', '')
         neg_one_to_one = config['dataloader']['train_dataset']['params'].get('neg_one_to_one', True)
         coef = config['dataloader']['test_dataset']['coefficient']
@@ -154,13 +180,22 @@ def main():
         sampling_steps = config['dataloader']['test_dataset']['sampling_steps']
 
         raw_sequence = load_raw_sequence(args.extend_input, dataset_name)
-        scaler = fit_sequence_scaler(raw_sequence, normalization=args.norm_method)
-        normalized_sequence, auto_norm = normalize_sequence(
-            raw_sequence,
-            scaler,
-            normalization=args.norm_method,
-            neg_one_to_one=neg_one_to_one,
-        )
+        if args.extend_zscore_only:
+            scaler = fit_sequence_scaler(raw_sequence, normalization='zscore')
+            normalized_sequence, auto_norm = normalize_sequence(
+                raw_sequence,
+                scaler,
+                normalization='zscore',
+                neg_one_to_one=False,
+            )
+        else:
+            scaler = fit_sequence_scaler(raw_sequence, normalization=args.norm_method)
+            normalized_sequence, auto_norm = normalize_sequence(
+                raw_sequence,
+                scaler,
+                normalization=args.norm_method,
+                neg_one_to_one=neg_one_to_one,
+            )
 
         extension_outputs = trainer.extend_sequence(
             normalized_sequence=normalized_sequence,
@@ -174,10 +209,16 @@ def main():
 
         generated_extension_norm = extension_outputs['generated_extension']
         extended_sequence_norm = extension_outputs['extended_sequence']
-        generated_extension_raw = inverse_normalize_sequence(generated_extension_norm, scaler, auto_norm=auto_norm)
-        extended_sequence_raw = inverse_normalize_sequence(extended_sequence_norm, scaler, auto_norm=auto_norm)
+        if args.extend_zscore_only:
+            generated_extension_raw = generated_extension_norm
+            extended_sequence_raw = extended_sequence_norm
+            history_for_eval = normalized_sequence
+        else:
+            generated_extension_raw = inverse_normalize_sequence(generated_extension_norm, scaler, auto_norm=auto_norm)
+            extended_sequence_raw = inverse_normalize_sequence(extended_sequence_norm, scaler, auto_norm=auto_norm)
+            history_for_eval = raw_sequence
         metrics = compute_extension_metrics(
-            history_raw=raw_sequence,
+            history_raw=history_for_eval,
             extension_raw=generated_extension_raw,
             compare_len=min(args.pred_len, generated_extension_raw.shape[0]),
         )
@@ -185,20 +226,25 @@ def main():
         np.save(os.path.join(args.save_dir, f'extension_input_raw_{args.name}.npy'), raw_sequence)
         np.save(os.path.join(args.save_dir, f'extension_input_norm_{args.name}.npy'), normalized_sequence)
         np.save(os.path.join(args.save_dir, f'extension_norm_{args.name}.npy'), generated_extension_norm)
+        if args.extend_zscore_only:
+            np.save(os.path.join(args.save_dir, f'extension_input_zscore_{args.name}.npy'), normalized_sequence)
+            np.save(os.path.join(args.save_dir, f'extension_zscore_{args.name}.npy'), generated_extension_norm)
         np.save(os.path.join(args.save_dir, f'extension_raw_{args.name}.npy'), generated_extension_raw)
         np.save(os.path.join(args.save_dir, f'extended_full_norm_{args.name}.npy'), extended_sequence_norm)
+        if args.extend_zscore_only:
+            np.save(os.path.join(args.save_dir, f'extended_full_zscore_{args.name}.npy'), extended_sequence_norm)
         np.save(os.path.join(args.save_dir, f'extended_full_raw_{args.name}.npy'), extended_sequence_raw)
         np.save(os.path.join(args.save_dir, f'extension_windows_norm_{args.name}.npy'), extension_outputs['restored_windows'])
         save_metrics(metrics, os.path.join(args.save_dir, f'extension_metrics_{args.name}.json'))
         save_extension_summary(
-            history_raw=raw_sequence,
+            history_raw=history_for_eval,
             extension_raw=generated_extension_raw,
             output_path=os.path.join(args.save_dir, f'extension_summary_{args.name}.png'),
         )
         logger.log_info(
             f"extension done | input_len={raw_sequence.shape[0]} | extend_len={generated_extension_raw.shape[0]} | "
             f"full_len={extended_sequence_raw.shape[0]} | seam_mae={metrics['seam_mae']:.6f} | "
-            f"fc_upper_corr={metrics['fc_upper_corr']:.6f}"
+            f"fc_upper_corr={metrics['fc_upper_corr']:.6f} | extend_zscore_only={args.extend_zscore_only}"
         )
         return
 
@@ -226,18 +272,49 @@ def main():
     if args.train:
         trainer.train()
     elif args.sample == 1 and args.mode in ['infill', 'predict']:
-        trainer.load(args.milestone)
+        checkpoint_ref = 'best' if args.use_best_checkpoint else args.milestone
+        trainer.load(checkpoint_ref)
         dataloader, dataset = test_dataloader_info['dataloader'], test_dataloader_info['dataset']
         coef = config['dataloader']['test_dataset']['coefficient']
         stepsize = config['dataloader']['test_dataset']['step_size'] 
         sampling_steps = config['dataloader']['test_dataset']['sampling_steps'] ## 采样步数：例如训练时的t设置为500，采样步数设为250，那就是隔一个采样一次
-        samples, *_ = trainer.restore(dataloader, [dataset.window, dataset.var_num], coef, stepsize, sampling_steps)
+        samples, reals, masks = trainer.restore(dataloader, [dataset.window, dataset.var_num], coef, stepsize, sampling_steps)
+        eval_samples = samples.copy()
+        eval_reals = reals.copy()
         if dataset.auto_norm:
             samples = unnormalize_to_zero_to_one(samples) # 先把数据从[-1,1]范围还原到[0,1]范围，因为在训练时我们把数据归一化到了[-1,1]，所以采样出来的也是这个范围的。要得到原始数据的数值，我们需要先把它们还原到[0,1]范围，然后再根据原始数据的分布进行反归一化，反归一化的代码是下一行，可以得到原始数据。
             samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape) # 反变换到原始数据
+            eval_samples = unnormalize_to_zero_to_one(eval_samples)
+            eval_reals = unnormalize_to_zero_to_one(eval_reals)
         np.save(os.path.join(args.save_dir, f'ddpm_{args.mode}_{args.name}.npy'), samples)
+        if args.mode == 'predict':
+            predict_metrics = compute_prediction_metrics(eval_samples, eval_reals, args.pred_len)
+            predict_summary = {
+                'experiment_name': args.name,
+                'num_test_windows': int(len(dataset)),
+                'seq_len': int(dataset.window),
+                'stride': int(getattr(dataset, 'stride', config['dataloader']['test_dataset']['params'].get('stride', 1))),
+                'normalization': config['dataloader']['test_dataset']['params'].get('normalization'),
+                'max_subjects': config['dataloader']['test_dataset']['params'].get('max_subjects'),
+                'l_loss': config['model']['params'].get('l_loss'),
+                'mmd_alpha': config['model']['params'].get('mmd_alpha'),
+                'pred_len': int(args.pred_len),
+                'checkpoint': trainer.loaded_checkpoint_meta,
+                'metrics': predict_metrics,
+            }
+            if trainer.best_val_loss is not None:
+                predict_summary['best_val_loss'] = trainer.best_val_loss
+                predict_summary['best_val_step'] = trainer.best_val_step
+            with open(os.path.join(args.save_dir, 'predict_summary.json'), 'w') as f:
+                json.dump(predict_summary, f, indent=2)
+            logger.log_info(
+                f"predict eval | mae={predict_metrics['mae']:.6f} | rmse={predict_metrics['rmse']:.6f} | "
+                f"mape={predict_metrics['mape']:.4f}% | fc_upper_corr={predict_metrics['fc_upper_corr']:.6f} | "
+                f"psd_l1={predict_metrics['psd_l1']:.6f}"
+            )
     else:
-        trainer.load(args.milestone)
+        checkpoint_ref = 'best' if args.use_best_checkpoint else args.milestone
+        trainer.load(checkpoint_ref)
         dataset = dataloader_info['dataset']
         samples = trainer.sample(num=len(dataset), size_every=2001, shape=[dataset.window, dataset.var_num])
         if dataset.auto_norm:
