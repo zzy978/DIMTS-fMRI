@@ -230,7 +230,10 @@ class Encoder(nn.Module):
         self.encoder_blocks = nn.Sequential(
             *[
                 MambaEncoderBlock(
-                    hidden_size=hidden_size, mlp_ratio=mlp_ratio, dstate=d_state, dconv=d_conv
+                    hidden_size=hidden_size, 
+                    mlp_ratio=mlp_ratio, 
+                    dstate=d_state, 
+                    dconv=d_conv
                 )
                 for _ in range(n_layers)
             ]
@@ -250,7 +253,10 @@ class Decoder_M(nn.Module):
         self.encoder_blocks = nn.Sequential(
             *[
                 DiMBlock(
-                    hidden_size=hidden_size, mlp_ratio=mlp_ratio, dstate=d_state, dconv=d_conv
+                    hidden_size=hidden_size, 
+                    mlp_ratio=mlp_ratio, 
+                    dstate=d_state, 
+                    dconv=d_conv
                 )
                 for _ in range(n_layers)
             ]
@@ -291,7 +297,11 @@ class Decoder_S(nn.Module):
         self.encoder_blocks = nn.Sequential(
             *[
                 DiSBlock(
-                    hidden_size=hidden_size, mlp_ratio=mlp_ratio, dstate=d_state, dconv=d_conv, conv_num=conv_num
+                    hidden_size=hidden_size, 
+                    mlp_ratio=mlp_ratio, 
+                    dstate=d_state, 
+                    dconv=d_conv, 
+                    conv_num=conv_num
                 )
                 for _ in range(n_layers)
             ]
@@ -420,10 +430,19 @@ class DiM(nn.Module):
         )
 
         self.time_blocks = Decoder_S(
-            hidden_size=hidden_size, num_heads=num_heads, n_layers=n_decoder, d_state=d_state, d_conv=d_conv, conv_num=conv_num
+            hidden_size=hidden_size, 
+            num_heads=num_heads, 
+            n_layers=n_decoder, 
+            d_state=d_state, 
+            d_conv=d_conv, 
+            conv_num=conv_num,
         )
         self.feature_blocks = Decoder_M(
-            hidden_size=hidden_size, num_heads=num_heads, n_layers=n_decoder, d_state=d_state, d_conv=d_conv,
+            hidden_size=hidden_size, 
+            num_heads=num_heads, 
+            n_layers=n_decoder, 
+            d_state=d_state, 
+            d_conv=d_conv,
         )
 
         self.fc_time = nn.Linear(hidden_size, input_shape[1])

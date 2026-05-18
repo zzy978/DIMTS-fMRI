@@ -24,18 +24,18 @@ model:
     # Fourier loss weight
     l_loss: 0.1
     sample_type: 'batch' #训练时怎么采样扩散步，batch 表示一个 batch 共用同一个 t
-    hidden_size: 256
-    n_encoder: 1
+    hidden_size: 256  # MLP中间层维度为 hidden_size * mlp_ratio
+    n_encoder: 2
     n_decoder: 3
     feature_last: True
     input_shape: [256,219]
     mlp_ratio: 4.0
     # latent state dimension of Mamba
-    d_state: 1
-    d_conv: 3
+    d_state: 1 # 这是 Mamba/SSM 的状态维度，也就是每个通道内部的隐状态大小。d_state 越大，SSM 能表达的动态系统更复杂，记忆能力更强
+    d_conv: 3  # reshape为2D时的depthwise convolution卷积核大小
     model_type: 'DiM'
     # dilated convolutions scale [1, 2, 3]
-    conv_num: 2
+    conv_num: 2  # 对应的是膨胀因子，conv_num == 2: 用 h1 + h2
 
 solver:
   base_lr: 1.0e-4
