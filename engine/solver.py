@@ -309,6 +309,37 @@ class Trainer(object):
                 )
         return sample[0].detach().cpu().numpy()
 
+    def restore_window_batch(self, target_windows, partial_masks, coef=1e-1, stepsize=1e-1, sampling_steps=50):
+        if target_windows.ndim != 3 or partial_masks.ndim != 3:
+            raise ValueError('target_windows and partial_masks must be shaped [batch, seq_len, feature_dim].')
+        if target_windows.shape != partial_masks.shape:
+            raise ValueError('target_windows and partial_masks must have the same shape.')
+
+        model_kwargs = {
+            'coef': coef,
+            'learning_rate': stepsize,
+        }
+        x = torch.from_numpy(target_windows).float().to(self.device)
+        t_m = torch.from_numpy(partial_masks.astype(bool)).to(self.device)
+
+        with torch.no_grad():
+            if sampling_steps == self.model.num_timesteps:
+                sample = self.ema.ema_model.sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                )
+            else:
+                sample = self.ema.ema_model.fast_sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                    sampling_timesteps=sampling_steps,
+                )
+        return sample.detach().cpu().numpy()
+
     def extend_sequence(
         self,
         normalized_sequence,

@@ -20,9 +20,9 @@ model:
     # DiMTS
 
     # correlation loss weight
-    mmd_alpha: 0.0005
+    mmd_alpha: 0.01
     # Fourier loss weight
-    l_loss: 0.0
+    l_loss: 0.1
     sample_type: 'batch' #训练时怎么采样扩散步，batch 表示一个 batch 共用同一个 t
     hidden_size: 256
     n_encoder: 1
@@ -39,10 +39,10 @@ model:
 
 solver:
   base_lr: 1.0e-4
-  max_epochs: 50000
+  max_epochs: 10000
   results_folder: ./Checkpoints_fmri_zscore
   gradient_accumulate_every: 2
-  save_cycle: 5000  # 多少步保存一次 checkpoint
+  save_cycle: 1000  # 多少步保存一次 checkpoint
   ema:  # EMA 模型参数
     decay: 0.995
     update_interval: 10
@@ -65,8 +65,9 @@ dataloader:
     params:
       name: fmri
       proportion: 0.9  # Set to rate < 1 if training conditional generation
-      data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv/102513.csv
+      data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv
       window: 256  # seq_length
+      stride: 64
       save2npy: True
       neg_one_to_one: True
       seed: 123
@@ -79,6 +80,7 @@ dataloader:
       proportion: 0.9  # rate
       data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv/102513.csv
       window: 256  # seq_length
+      stride: 64
       save2npy: True
       neg_one_to_one: True
       seed: 123

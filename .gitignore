@@ -1,0 +1,87 @@
+# ===== 本地环境与编辑器配置 =====
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+.codex
+AGENTS.md
+
+# ===== Python 缓存与测试缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ===== 编译、构建与扩展模块产物 =====
+build/
+dist/
+*.egg-info/
+*.egg
+*.so
+*.o
+*.a
+*.ninja
+.ninja_deps
+.ninja_log
+kernels/**/build/
+
+# ===== 训练输出、日志与实验记录 =====
+logs/
+runs/
+wandb/
+tensorboard/
+events.out.tfevents*
+output/
+outputs/
+OUTPUT/
+Checkpoints*/
+checkpoints/
+*.log
+
+# ===== 数据集、预处理数据与中间结果 =====
+data/
+dataset/
+datasets/
+Data/datasets/
+Data/order/
+*.npy
+*.npz
+*.csv
+*.tsv
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.mat
+
+# ===== 模型权重与大文件产物 =====
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# ===== 图片、论文和可视化结果 =====
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+*.pdf
+
+# ===== 临时文件 =====
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
