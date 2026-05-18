@@ -21,6 +21,8 @@ from Utils.extension_utils import (
     save_metrics,
 )
 
+Z_SCORE_NORMALIZATION = 'zscore'  # 固定只使用 z-score 标准化，避免入口处再切换其它标准化方式。
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Training Script')
@@ -63,9 +65,6 @@ def parse_args():
                         help='Use best.pt for sample/predict/extend instead of checkpoint-<milestone>.pt.')
     parser.add_argument('--checkpoint_name', type=str, default=None,
                         help='Optional checkpoint subdirectory name under solver.results_folder for experiment isolation.')
-    parser.add_argument('--norm_method', type=str, default='minmax',
-                        choices=['minmax', 'zscore'],
-                        help='Normalization method for dataset preprocessing.')
     parser.add_argument('--data_input_mode', type=str, default='single_csv',
                         choices=['single_csv', 'subject_split'],
                         help='Dataset input mode: single CSV file or subject-level directory split.')
@@ -89,8 +88,6 @@ def parse_args():
                         help='Total number of future timepoints to generate for sequence extension.')
     parser.add_argument('--autoregressive', action='store_true', default=False,
                         help='Use iterative autoregressive continuation for sequence extension.')
-    parser.add_argument('--extend_zscore_only', action='store_true', default=False,
-                        help='For sequence extension only, use per-ROI z-score directly as model input/output without minmax or inverse transform.')
     
     # args for modify config
     parser.add_argument('opts', help='Modify config options using the command-line',
@@ -114,8 +111,8 @@ def main():
     config = merge_opts_to_config(config, args.opts)
     if args.checkpoint_name is not None:
         config['solver']['results_folder'] = os.path.join(config['solver']['results_folder'], args.checkpoint_name)
-    config['dataloader']['train_dataset']['params']['normalization'] = args.norm_method
-    config['dataloader']['test_dataset']['params']['normalization'] = args.norm_method
+    config['dataloader']['train_dataset']['params']['normalization'] = Z_SCORE_NORMALIZATION
+    config['dataloader']['test_dataset']['params']['normalization'] = Z_SCORE_NORMALIZATION
     if args.lambda1 is not None:
         config['model']['params']['l_loss'] = args.lambda1
     if args.lambda2 is not None:
@@ -140,7 +137,7 @@ def main():
             params = config['dataloader'][dataset_key]['params']
             params['data_root'] = subject_root
             params['period'] = period
-            params['normalization'] = args.norm_method
+            params['normalization'] = Z_SCORE_NORMALIZATION
             params['subject_train_ratio'] = args.subject_train_ratio
             params['subject_val_ratio'] = args.subject_val_ratio
             params['subject_test_ratio'] = args.subject_test_ratio
@@ -174,28 +171,18 @@ def main():
         checkpoint_ref = 'best' if args.use_best_checkpoint else args.milestone
         trainer.load(checkpoint_ref)
         dataset_name = config['dataloader']['train_dataset']['params'].get('name', '')
-        neg_one_to_one = config['dataloader']['train_dataset']['params'].get('neg_one_to_one', True)
         coef = config['dataloader']['test_dataset']['coefficient']
         stepsize = config['dataloader']['test_dataset']['step_size']
         sampling_steps = config['dataloader']['test_dataset']['sampling_steps']
 
         raw_sequence = load_raw_sequence(args.extend_input, dataset_name)
-        if args.extend_zscore_only:
-            scaler = fit_sequence_scaler(raw_sequence, normalization='zscore')
-            normalized_sequence, auto_norm = normalize_sequence(
-                raw_sequence,
-                scaler,
-                normalization='zscore',
-                neg_one_to_one=False,
-            )
-        else:
-            scaler = fit_sequence_scaler(raw_sequence, normalization=args.norm_method)
-            normalized_sequence, auto_norm = normalize_sequence(
-                raw_sequence,
-                scaler,
-                normalization=args.norm_method,
-                neg_one_to_one=neg_one_to_one,
-            )
+        scaler = fit_sequence_scaler(raw_sequence, normalization=Z_SCORE_NORMALIZATION)
+        normalized_sequence, auto_norm = normalize_sequence(
+            raw_sequence,
+            scaler,
+            normalization=Z_SCORE_NORMALIZATION,
+            neg_one_to_one=False,  # z-score 不再额外映射到 [-1, 1]，保持标准化后的均值/方差语义。
+        )
 
         extension_outputs = trainer.extend_sequence(
             normalized_sequence=normalized_sequence,
@@ -209,31 +196,21 @@ def main():
 
         generated_extension_norm = extension_outputs['generated_extension']
         extended_sequence_norm = extension_outputs['extended_sequence']
-        if args.extend_zscore_only:
-            generated_extension_raw = generated_extension_norm
-            extended_sequence_raw = extended_sequence_norm
-            history_for_eval = normalized_sequence
-        else:
-            generated_extension_raw = inverse_normalize_sequence(generated_extension_norm, scaler, auto_norm=auto_norm)
-            extended_sequence_raw = inverse_normalize_sequence(extended_sequence_norm, scaler, auto_norm=auto_norm)
-            history_for_eval = raw_sequence
+        generated_extension_raw = inverse_normalize_sequence(generated_extension_norm, scaler, auto_norm=auto_norm)
+        extended_sequence_raw = inverse_normalize_sequence(extended_sequence_norm, scaler, auto_norm=auto_norm)
+        history_for_eval = raw_sequence
         metrics = compute_extension_metrics(
             history_raw=history_for_eval,
             extension_raw=generated_extension_raw,
             compare_len=min(args.pred_len, generated_extension_raw.shape[0]),
         )
 
-        np.save(os.path.join(args.save_dir, f'extension_input_raw_{args.name}.npy'), raw_sequence)
+        # np.save(os.path.join(args.save_dir, f'extension_input_raw_{args.name}.npy'), raw_sequence)
         np.save(os.path.join(args.save_dir, f'extension_input_norm_{args.name}.npy'), normalized_sequence)
         np.save(os.path.join(args.save_dir, f'extension_norm_{args.name}.npy'), generated_extension_norm)
-        if args.extend_zscore_only:
-            np.save(os.path.join(args.save_dir, f'extension_input_zscore_{args.name}.npy'), normalized_sequence)
-            np.save(os.path.join(args.save_dir, f'extension_zscore_{args.name}.npy'), generated_extension_norm)
-        np.save(os.path.join(args.save_dir, f'extension_raw_{args.name}.npy'), generated_extension_raw)
+        # np.save(os.path.join(args.save_dir, f'extension_raw_{args.name}.npy'), generated_extension_raw)
         np.save(os.path.join(args.save_dir, f'extended_full_norm_{args.name}.npy'), extended_sequence_norm)
-        if args.extend_zscore_only:
-            np.save(os.path.join(args.save_dir, f'extended_full_zscore_{args.name}.npy'), extended_sequence_norm)
-        np.save(os.path.join(args.save_dir, f'extended_full_raw_{args.name}.npy'), extended_sequence_raw)
+        # np.save(os.path.join(args.save_dir, f'extended_full_raw_{args.name}.npy'), extended_sequence_raw)
         np.save(os.path.join(args.save_dir, f'extension_windows_norm_{args.name}.npy'), extension_outputs['restored_windows'])
         save_metrics(metrics, os.path.join(args.save_dir, f'extension_metrics_{args.name}.json'))
         save_extension_summary(
@@ -244,7 +221,7 @@ def main():
         logger.log_info(
             f"extension done | input_len={raw_sequence.shape[0]} | extend_len={generated_extension_raw.shape[0]} | "
             f"full_len={extended_sequence_raw.shape[0]} | seam_mae={metrics['seam_mae']:.6f} | "
-            f"fc_upper_corr={metrics['fc_upper_corr']:.6f} | extend_zscore_only={args.extend_zscore_only}"
+            f"fc_upper_corr={metrics['fc_upper_corr']:.6f} | normalization={Z_SCORE_NORMALIZATION}"
         )
         return
 
@@ -281,11 +258,11 @@ def main():
         samples, reals, masks = trainer.restore(dataloader, [dataset.window, dataset.var_num], coef, stepsize, sampling_steps)
         eval_samples = samples.copy()
         eval_reals = reals.copy()
-        if dataset.auto_norm:
-            samples = unnormalize_to_zero_to_one(samples) # 先把数据从[-1,1]范围还原到[0,1]范围，因为在训练时我们把数据归一化到了[-1,1]，所以采样出来的也是这个范围的。要得到原始数据的数值，我们需要先把它们还原到[0,1]范围，然后再根据原始数据的分布进行反归一化，反归一化的代码是下一行，可以得到原始数据。
-            samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape) # 反变换到原始数据
-            eval_samples = unnormalize_to_zero_to_one(eval_samples)
-            eval_reals = unnormalize_to_zero_to_one(eval_reals)
+        # if dataset.auto_norm:
+        #     samples = unnormalize_to_zero_to_one(samples) # 先把数据从[-1,1]范围还原到[0,1]范围，因为在训练时我们把数据归一化到了[-1,1]，所以采样出来的也是这个范围的。要得到原始数据的数值，我们需要先把它们还原到[0,1]范围，然后再根据原始数据的分布进行反归一化，反归一化的代码是下一行，可以得到原始数据。
+        #     samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape) # 反变换到原始数据
+        #     eval_samples = unnormalize_to_zero_to_one(eval_samples)
+        #     eval_reals = unnormalize_to_zero_to_one(eval_reals)
         np.save(os.path.join(args.save_dir, f'ddpm_{args.mode}_{args.name}.npy'), samples)
         if args.mode == 'predict':
             predict_metrics = compute_prediction_metrics(eval_samples, eval_reals, args.pred_len)
@@ -317,8 +294,8 @@ def main():
         trainer.load(checkpoint_ref)
         dataset = dataloader_info['dataset']
         samples = trainer.sample(num=len(dataset), size_every=2001, shape=[dataset.window, dataset.var_num])
-        if dataset.auto_norm:
-            samples = unnormalize_to_zero_to_one(samples)
+        # if dataset.auto_norm:
+        #     samples = unnormalize_to_zero_to_one(samples)
             # samples = dataset.scaler.inverse_transform(samples.reshape(-1, samples.shape[-1])).reshape(samples.shape)
         np.save(os.path.join(args.save_dir, f'ddpm_fake_{args.name}.npy'), samples)
 
