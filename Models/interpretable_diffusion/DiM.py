@@ -380,6 +380,35 @@ class TimeSeries2EmbLinear(nn.Module):
         return self.processing(x.permute(0, 2, 1))
 
 
+class AdaptiveFunctionalGraphMixer(nn.Module):
+    def __init__(self, num_nodes, hidden_size, graph_rank=64):
+        super().__init__()
+        graph_rank = min(graph_rank, hidden_size)
+        self.scale = graph_rank ** -0.5
+        self.node_emb = nn.Parameter(torch.randn(num_nodes, graph_rank) * 0.02)
+        self.graph_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.timestep_emb = TimestepEmbedder(hidden_size)
+        self.gate = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x, t):
+        # 学习一个全局 ROI 功能图，在 feature token 上做结构聚合。
+        adj = torch.softmax(torch.matmul(self.node_emb, self.node_emb.t()) * self.scale, dim=-1)
+        x_graph = torch.matmul(adj.to(dtype=x.dtype, device=x.device), x)
+        graph_update = self.graph_mlp(x_graph)
+        # 不同扩散步的噪声强度不同，用 t 控制图结构残差的注入强度。
+        gate = self.gate(self.timestep_emb(t)).unsqueeze(1)
+        return x + gate * graph_update
+
+
 class DiM(nn.Module):
     def __init__(
         self,
@@ -397,6 +426,11 @@ class DiM(nn.Module):
         trans_mx=None,
     ):
         super().__init__()
+        if feature_last:
+            sequence_length, feature_size = input_shape
+        else:
+            feature_size, sequence_length = input_shape
+
         self.time2emb = TimeSeries2EmbLinear(
             hidden_size=hidden_size,
             feature_last=feature_last,
@@ -441,12 +475,22 @@ class DiM(nn.Module):
             hidden_size=hidden_size, 
             num_heads=num_heads, 
             n_layers=n_decoder, 
-            d_state=d_state, 
+            d_state=d_state,
             d_conv=d_conv,
+        )
+        self.feature_graph_mixer = AdaptiveFunctionalGraphMixer(
+            num_nodes=feature_size,
+            hidden_size=hidden_size,
         )
 
         self.fc_time = nn.Linear(hidden_size, input_shape[1])
         self.fc_feature = nn.Linear(hidden_size, input_shape[0])
+        self.branch_fusion_emb = TimestepEmbedder(hidden_size)
+        self.branch_fusion_gate = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, feature_size),
+            nn.Sigmoid(),
+        )
 
         self.trans_mx = trans_mx
 
@@ -463,11 +507,16 @@ class DiM(nn.Module):
             x_feature = self.feature2emb(torch.matmul(self.trans_mx, x.permute(0, 2, 1)).permute(0, 2, 1))
 
         x_feature = self.feature_encoder(x_feature)
+        x_feature = self.feature_graph_mixer(x_feature, t)
         x_feature, x0, dt, A, B, C, bias = self.feature_blocks(x_feature, t)
         x_feature = self.fc_feature(x_feature)
 
         if self.trans_mx is None:
-            return x_feature.permute(0, 2, 1) + x_time
+            x_feature = x_feature.permute(0, 2, 1)
         else:
             x_feature = torch.matmul(torch.linalg.inv(self.trans_mx), x_feature)
-            return x_feature.permute(0, 2, 1) + x_time
+            x_feature = x_feature.permute(0, 2, 1)
+
+        # 用扩散时间步决定 time branch 与 feature branch 的融合比例，替代固定相加。
+        time_gate = self.branch_fusion_gate(self.branch_fusion_emb(t)).unsqueeze(1)
+        return time_gate * x_time + (1. - time_gate) * x_feature
