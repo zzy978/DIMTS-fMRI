@@ -429,13 +429,13 @@ class DiM(nn.Module):
             d_conv=d_conv,
         )
 
-        self.time_blocks = Decoder_S(
+        # 本实验让 time branch 使用 SelectSSM，与 feature branch 保持同类 decoder。
+        self.time_blocks = Decoder_M(
             hidden_size=hidden_size, 
             num_heads=num_heads, 
             n_layers=n_decoder, 
             d_state=d_state, 
-            d_conv=d_conv, 
-            conv_num=conv_num,
+            d_conv=d_conv,
         )
         self.feature_blocks = Decoder_M(
             hidden_size=hidden_size, 
@@ -454,7 +454,7 @@ class DiM(nn.Module):
 
         x_time = self.time2emb(x)
         x_time = self.time_encoder(x_time)
-        x_time = self.time_blocks(x_time, t)
+        x_time, _, _, _, _, _, _ = self.time_blocks(x_time, t)
         x_time = self.fc_time(x_time)
 
         if self.trans_mx is None:
