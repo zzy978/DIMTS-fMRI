@@ -381,11 +381,14 @@ class TimeSeries2EmbLinear(nn.Module):
 
 
 class AdaptiveFunctionalGraphMixer(nn.Module):
-    def __init__(self, num_nodes, hidden_size, graph_rank=64):
+    def __init__(self, num_nodes, hidden_size, graph_rank=64, identity_bias=5.0):
         super().__init__()
         graph_rank = min(graph_rank, hidden_size)
         self.scale = graph_rank ** -0.5
         self.node_emb = nn.Parameter(torch.randn(num_nodes, graph_rank) * 0.02)
+        self.identity_bias = nn.Parameter(torch.tensor(float(identity_bias)))
+        self.graph_scale = nn.Parameter(torch.zeros(1))
+        self.register_buffer('identity', torch.eye(num_nodes), persistent=False)
         self.graph_mlp = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
@@ -400,13 +403,17 @@ class AdaptiveFunctionalGraphMixer(nn.Module):
         )
 
     def forward(self, x, t):
-        # 学习一个全局 ROI 功能图，在 feature token 上做结构聚合。
-        adj = torch.softmax(torch.matmul(self.node_emb, self.node_emb.t()) * self.scale, dim=-1)
+         # 用自连接偏置避免初始邻接矩阵退化成全局均匀平均。
+        identity = self.identity.to(dtype=x.dtype, device=x.device)
+        adj_logits = torch.matmul(self.node_emb, self.node_emb.t()) * self.scale
+        adj_logits = adj_logits.to(dtype=x.dtype, device=x.device) + self.identity_bias.to(dtype=x.dtype) * identity
+        adj = torch.softmax(adj_logits, dim=-1)
         x_graph = torch.matmul(adj.to(dtype=x.dtype, device=x.device), x)
         graph_update = self.graph_mlp(x_graph)
         # 不同扩散步的噪声强度不同，用 t 控制图结构残差的注入强度。
         gate = self.gate(self.timestep_emb(t)).unsqueeze(1)
-        return x + gate * graph_update
+        # graph_scale 从 0 开始，使模型初始等价于不使用图模块。
+        return x + self.graph_scale.to(dtype=x.dtype) * gate * graph_update
 
 
 class DiM(nn.Module):
@@ -517,6 +524,4 @@ class DiM(nn.Module):
             x_feature = torch.matmul(torch.linalg.inv(self.trans_mx), x_feature)
             x_feature = x_feature.permute(0, 2, 1)
 
-        # 用扩散时间步决定 time branch 与 feature branch 的融合比例，替代固定相加。
-        time_gate = self.branch_fusion_gate(self.branch_fusion_emb(t)).unsqueeze(1)
-        return time_gate * x_time + (1. - time_gate) * x_feature
+        return x_feature.permute(0, 2, 1) + x_time
