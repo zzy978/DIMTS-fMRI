@@ -524,4 +524,4 @@ class DiM(nn.Module):
             x_feature = torch.matmul(torch.linalg.inv(self.trans_mx), x_feature)
             x_feature = x_feature.permute(0, 2, 1)
 
-        return x_feature.permute(0, 2, 1) + x_time
+        return x_feature + x_time

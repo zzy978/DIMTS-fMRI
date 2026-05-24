@@ -25,7 +25,6 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
   --checkpoint_name "${CHECKPOINT_NAME}" \
   --use_best_checkpoint \
   --gpu "${GPU_ID}" \
-  --norm_method zscore \
   --pred_len "${PRED_LEN}" \
   --batch_size "${BATCH_SIZE}" \
   --extend_lengths 128 256 384 512 \

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=partition_1
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=fmri_seq256_train
+#SBATCH --job-name=ROIGraph_IdentityBias_seq256_train
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -26,14 +26,12 @@ BEST_SUBJECTS="${BEST_SUBJECTS:-400}"
 PRED_LEN="${PRED_LEN:-128}"
 TRAIN_STEPS="${TRAIN_STEPS:-10000}"
 STRIDE="${STRIDE:-64}"
-NORM_METHOD="${NORM_METHOD:-zscore}"
 ARRAY_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 COMMON_ARGS=(
   --config_file "${CONFIG_FILE}"
   --gpu "${GPU_ID}"
   --train
-  --norm_method "${NORM_METHOD}"
   --data_input_mode subject_split
   --subject_train_ratio 0.8
   --subject_val_ratio 0.1
@@ -61,13 +59,15 @@ if [ "${EXPERIMENT_GROUP}" = "phase_a" ]; then
     "${COMMON_ARGS[@]}" \
     solver.max_epochs "${TRAIN_STEPS}"
 elif [ "${EXPERIMENT_GROUP}" = "phase_b" ]; then
-  LAMBDA1S=(0.01 0.1 1.0 0.1 0.1)
-  LAMBDA2S=(0.0001 0.001 0.001 0.01 0.1)
+  # Phase B：尝试兼顾 FC / 结构相似性的损失权重组合。
+  LAMBDA1S=(0.3 1.0 0.3 0.1 0.1)
+  LAMBDA2S=(0.001 0.001 0.003 0.003 0.01)
 
   LAMBDA1="${LAMBDA1S[$ARRAY_ID]}"
   LAMBDA2="${LAMBDA2S[$ARRAY_ID]}"
   EXP_IDX=$((ARRAY_ID + 1))
-  EXP_NAME="fmri_seq256_zscore_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
+  # 改实验名，实验名是跟模型保存名相关的，改了实验名就相当于改了模型名，注意还要跟predict_fmri_experiments里对应的实验名一致
+  EXP_NAME="fmri_seq256_zscore_ROIGraph_IdentityBias_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
   CHECKPOINT_NAME="${EXP_NAME}"
 
   "${PYTHON_BIN}" main.py \

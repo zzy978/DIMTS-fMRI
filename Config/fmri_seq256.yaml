@@ -68,7 +68,7 @@ dataloader:
       data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv
       window: 256  # seq_length
       stride: 64
-      save2npy: True
+      save2npy: False
       neg_one_to_one: True
       seed: 123
       period: train
@@ -81,7 +81,7 @@ dataloader:
       data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv/102513.csv
       window: 256  # seq_length
       stride: 64
-      save2npy: True
+      save2npy: False
       neg_one_to_one: True
       seed: 123
       period: test
