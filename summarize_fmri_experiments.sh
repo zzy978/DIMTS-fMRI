@@ -19,6 +19,6 @@ if [ ! -x "${PYTHON_BIN}" ]; then
 fi
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-OUTPUT}"
-CSV_PATH="${CSV_PATH:-OUTPUT/experiment_summary_DFCGraph_change_lambda.csv}"
+CSV_PATH="${CSV_PATH:-OUTPUT/experiment_summary_DFCGraph_MMDablate_change_lambda.csv}"
 
 "${PYTHON_BIN}" summarize_experiments.py --output_root "${OUTPUT_ROOT}" --csv_path "${CSV_PATH}"
