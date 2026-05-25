@@ -64,6 +64,13 @@ class DiM_TS(nn.Module):
             model_type='SMTS',
             conv_num=3,
             trans_mx=None,
+            use_dynamic_fc_graph=False,
+            graph_heads=4,
+            graph_topk=16,
+            graph_rank=64,
+            graph_residual_init=0.0,
+            use_graph_conditioned_fusion=True,
+            use_raw_correlation=True,
             **kwargs
     ):
         super(DiM_TS, self).__init__()
@@ -85,7 +92,11 @@ class DiM_TS(nn.Module):
                     trans_mx0[s_list[i],i] = 1
                 trans_mx0 = trans_mx0.cuda()
             self.model = DiM(hidden_size=hidden_size,n_encoder=n_encoder,n_decoder=n_decoder,feature_last=feature_last,
-                             mlp_ratio=mlp_ratio,input_shape=input_shape,d_state=d_state,d_conv=d_conv,conv_num=conv_num,trans_mx=trans_mx0)
+                             mlp_ratio=mlp_ratio,input_shape=input_shape,d_state=d_state,d_conv=d_conv,conv_num=conv_num,trans_mx=trans_mx0,
+                             use_dynamic_fc_graph=use_dynamic_fc_graph,graph_heads=graph_heads,graph_topk=graph_topk,
+                             graph_rank=graph_rank,graph_residual_init=graph_residual_init,
+                             use_graph_conditioned_fusion=use_graph_conditioned_fusion,
+                             use_raw_correlation=use_raw_correlation,diffusion_steps=timesteps)
 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)

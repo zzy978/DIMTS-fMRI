@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=partition_1
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=ROIGraph_IdentityBias_seq256_train
+#SBATCH --job-name=DFCGraph_seq256_train
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -19,7 +19,7 @@ if [ ! -x "${PYTHON_BIN}" ]; then
   exit 1
 fi
 
-CONFIG_FILE="./Config/fmri_seq256.yaml"
+CONFIG_FILE="./Config/fmri_seq256_dfc.yaml"
 GPU_ID="${GPU_ID:-0}"
 EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-phase_a}"
 BEST_SUBJECTS="${BEST_SUBJECTS:-400}"
@@ -67,7 +67,7 @@ elif [ "${EXPERIMENT_GROUP}" = "phase_b" ]; then
   LAMBDA2="${LAMBDA2S[$ARRAY_ID]}"
   EXP_IDX=$((ARRAY_ID + 1))
   # 改实验名，实验名是跟模型保存名相关的，改了实验名就相当于改了模型名，注意还要跟predict_fmri_experiments里对应的实验名一致
-  EXP_NAME="fmri_seq256_zscore_ROIGraph_IdentityBias_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
+  EXP_NAME="fmri_seq256_zscore_DFCGraph_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
   CHECKPOINT_NAME="${EXP_NAME}"
 
   "${PYTHON_BIN}" main.py \

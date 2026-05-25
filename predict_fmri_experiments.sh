@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=partition_1
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=ROIGraph_IdentityBias_seq256_pred
+#SBATCH --job-name=DFCGraph_seq256_pred
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -25,7 +25,7 @@ if [ ! -x "${PYTHON_BIN}" ]; then
   exit 1
 fi
 
-CONFIG_FILE="./Config/fmri_seq256.yaml"
+CONFIG_FILE="./Config/fmri_seq256_dfc.yaml"
 GPU_ID="${GPU_ID:-0}"
 EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-phase_a}"
 BEST_SUBJECTS="${BEST_SUBJECTS:-400}"
@@ -73,7 +73,7 @@ elif [ "${EXPERIMENT_GROUP}" = "phase_b" ]; then
   LAMBDA1="${LAMBDA1S[$ARRAY_ID]}"
   LAMBDA2="${LAMBDA2S[$ARRAY_ID]}"
   EXP_IDX=$((ARRAY_ID + 1))
-  EXP_NAME="fmri_seq256_zscore_ROIGraph_IdentityBias_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
+  EXP_NAME="fmri_seq256_zscore_DFCGraph_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
   CHECKPOINT_NAME="${EXP_NAME}"
 
   "${PYTHON_BIN}" main.py \

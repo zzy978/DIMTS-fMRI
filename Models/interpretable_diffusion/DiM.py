@@ -416,6 +416,199 @@ class AdaptiveFunctionalGraphMixer(nn.Module):
         return x + self.graph_scale.to(dtype=x.dtype) * gate * graph_update
 
 
+class DynamicFunctionalGraphConditioner(nn.Module):
+    def __init__(
+        self,
+        num_nodes,
+        hidden_size,
+        graph_heads=4,
+        graph_topk=16,
+        graph_rank=64,
+        use_raw_correlation=True,
+        diffusion_steps=1000,
+    ):
+        super().__init__()
+        if hidden_size % graph_heads != 0:
+            raise ValueError('hidden_size must be divisible by graph_heads.')
+        if graph_heads <= 0:
+            raise ValueError('graph_heads must be positive.')
+
+        self.num_nodes = num_nodes
+        self.graph_heads = graph_heads
+        self.graph_rank = min(graph_rank, hidden_size)
+        self.graph_topk = graph_topk
+        self.use_raw_correlation = use_raw_correlation
+        self.diffusion_steps = max(int(diffusion_steps), 1)
+        self.scale = self.graph_rank ** -0.5
+
+        self.token_norm = nn.LayerNorm(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, graph_heads * self.graph_rank, bias=False)
+        self.k_proj = nn.Linear(hidden_size, graph_heads * self.graph_rank, bias=False)
+        self.v_proj = nn.Linear(hidden_size, graph_heads * self.graph_rank, bias=False)
+        self.out_proj = nn.Linear(graph_heads * self.graph_rank, hidden_size)
+        self.context_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.self_loop_bias = nn.Parameter(torch.tensor(2.0))
+        self.raw_corr_scale = nn.Parameter(torch.zeros(1))
+        self.register_buffer('identity', torch.eye(num_nodes), persistent=False)
+
+    def _to_heads(self, x):
+        b, n, _ = x.shape
+        x = x.view(b, n, self.graph_heads, self.graph_rank)
+        return x.permute(0, 2, 1, 3).contiguous()
+
+    @staticmethod
+    def _window_corrcoef(x):
+        x = x - x.mean(dim=1, keepdim=True)
+        denom = torch.sqrt(torch.sum(x * x, dim=1, keepdim=True).clamp_min(1e-6))
+        x = x / denom
+        corr = torch.matmul(x.transpose(1, 2), x)
+        return torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _apply_topk(self, logits):
+        topk = int(self.graph_topk)
+        if topk <= 0 or topk >= logits.shape[-1]:
+            return logits
+
+        b, h, n, _ = logits.shape
+        mask_value = -torch.finfo(logits.dtype).max
+        identity_mask = self.identity.to(device=logits.device, dtype=torch.bool).view(1, 1, n, n)
+        keep_mask = identity_mask.expand(b, h, n, n).clone()
+
+        # 每个 ROI 行保留自环和 top-k-1 个动态邻居，避免 softmax 退化成全脑平均。
+        if topk > 1:
+            non_self_logits = logits.masked_fill(identity_mask, mask_value)
+            topk_indices = torch.topk(non_self_logits, k=topk - 1, dim=-1).indices
+            keep_mask.scatter_(-1, topk_indices, True)
+        return logits.masked_fill(~keep_mask, mask_value)
+
+    def forward(self, x_t, roi_tokens, t):
+        token_input = self.token_norm(roi_tokens)
+        q = self._to_heads(self.q_proj(token_input))
+        k = self._to_heads(self.k_proj(token_input))
+        v = self._to_heads(self.v_proj(token_input))
+
+        graph_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        identity = self.identity.to(dtype=graph_logits.dtype, device=graph_logits.device)
+        graph_logits = graph_logits + self.self_loop_bias.to(dtype=graph_logits.dtype) * identity.view(1, 1, self.num_nodes, self.num_nodes)
+
+        if self.use_raw_correlation:
+            corr = self._window_corrcoef(x_t).to(dtype=graph_logits.dtype)
+            # 高噪声扩散步的瞬时相关矩阵不可靠，用 timestep gate 让低噪声步更多参考 BOLD 相关。
+            t_scale = t.to(dtype=graph_logits.dtype).clamp_min(0) / max(float(self.diffusion_steps - 1), 1.0)
+            corr_gate = (1.0 - t_scale.clamp(0, 1)).view(-1, 1, 1, 1)
+            graph_logits = graph_logits + corr_gate * self.raw_corr_scale.sigmoid().to(dtype=graph_logits.dtype) * corr.unsqueeze(1)
+
+        graph_logits = self._apply_topk(graph_logits)
+        a_dyn = torch.softmax(graph_logits, dim=-1)
+        context_heads = torch.matmul(a_dyn, v)
+        context_heads = context_heads.permute(0, 2, 1, 3).contiguous()
+        context_heads = context_heads.view(roi_tokens.shape[0], self.num_nodes, self.graph_heads * self.graph_rank)
+        roi_context = self.out_proj(context_heads)
+        graph_context = self.context_mlp(roi_context.mean(dim=1))
+        return a_dyn, roi_context, graph_context
+
+
+class DynamicFunctionalGraphBlock(nn.Module):
+    def __init__(self, hidden_size, mlp_ratio=4.0, graph_residual_init=0.0):
+        super().__init__()
+        self.norm_graph = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.graph_mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0,
+        )
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        self.graph_scale = nn.Parameter(torch.tensor(float(graph_residual_init)))
+
+    def forward(self, x, roi_context, c):
+        shift_graph, scale_graph, gate_graph, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+        # roi_context 已经由动态图聚合得到，这里只做残差注入，避免把 ROI 顺序当作一维序列扫描。
+        graph_update = self.graph_mlp(
+            modulate(self.norm_graph(roi_context), shift_graph, scale_graph)
+        )
+        x = x + self.graph_scale.to(dtype=x.dtype) * gate_graph.unsqueeze(1) * graph_update
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        )
+        return x
+
+
+class DynamicFunctionalGraphDecoder(nn.Module):
+    def __init__(
+        self,
+        num_nodes,
+        hidden_size=512,
+        n_layers=3,
+        mlp_ratio=4.0,
+        graph_heads=4,
+        graph_topk=16,
+        graph_rank=64,
+        graph_residual_init=0.0,
+        use_raw_correlation=True,
+        diffusion_steps=1000,
+    ):
+        super().__init__()
+        self.conditioner = DynamicFunctionalGraphConditioner(
+            num_nodes=num_nodes,
+            hidden_size=hidden_size,
+            graph_heads=graph_heads,
+            graph_topk=graph_topk,
+            graph_rank=graph_rank,
+            use_raw_correlation=use_raw_correlation,
+            diffusion_steps=diffusion_steps,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                DynamicFunctionalGraphBlock(
+                    hidden_size=hidden_size,
+                    mlp_ratio=mlp_ratio,
+                    graph_residual_init=graph_residual_init,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+        self.diffusion_step_emb = TimestepEmbedder(hidden_size)
+
+    def forward(self, x, x_t, t):
+        c_t = self.diffusion_step_emb(t)
+        graph_context_sum = torch.zeros_like(c_t)
+        last_a_dyn = None
+        last_roi_context = None
+
+        for block in self.blocks:
+            a_dyn, roi_context, graph_context = self.conditioner(x_t, x, t)
+            x = block(x, roi_context, c_t + graph_context)
+            graph_context_sum = graph_context_sum + graph_context
+            last_a_dyn = a_dyn
+            last_roi_context = roi_context
+
+        if len(self.blocks) == 0:
+            last_a_dyn, last_roi_context, graph_context_sum = self.conditioner(x_t, x, t)
+        else:
+            graph_context_sum = graph_context_sum / len(self.blocks)
+
+        return x, last_a_dyn, last_roi_context, graph_context_sum
+
+
 class DiM(nn.Module):
     def __init__(
         self,
@@ -431,12 +624,23 @@ class DiM(nn.Module):
         d_conv=2,
         conv_num=3,
         trans_mx=None,
+        use_dynamic_fc_graph=False,
+        graph_heads=4,
+        graph_topk=16,
+        graph_rank=64,
+        graph_residual_init=0.0,
+        use_graph_conditioned_fusion=True,
+        use_raw_correlation=True,
+        diffusion_steps=1000,
     ):
         super().__init__()
         if feature_last:
             sequence_length, feature_size = input_shape
         else:
             feature_size, sequence_length = input_shape
+
+        self.use_dynamic_fc_graph = use_dynamic_fc_graph
+        self.use_graph_conditioned_fusion = use_graph_conditioned_fusion
 
         self.time2emb = TimeSeries2EmbLinear(
             hidden_size=hidden_size,
@@ -461,14 +665,6 @@ class DiM(nn.Module):
             d_state=d_state,
             d_conv=d_conv,
         )
-        self.feature_encoder = Encoder(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            n_layers=n_encoder,
-            mlp_ratio=mlp_ratio,
-            d_state=d_state,
-            d_conv=d_conv,
-        )
 
         # 本实验让 time branch 使用 SelectSSM，与 feature branch 保持同类 decoder。
         self.time_blocks = Decoder_M(
@@ -478,17 +674,40 @@ class DiM(nn.Module):
             d_state=d_state, 
             d_conv=d_conv,
         )
-        self.feature_blocks = Decoder_M(
-            hidden_size=hidden_size, 
-            num_heads=num_heads, 
-            n_layers=n_decoder, 
-            d_state=d_state,
-            d_conv=d_conv,
-        )
-        self.feature_graph_mixer = AdaptiveFunctionalGraphMixer(
-            num_nodes=feature_size,
-            hidden_size=hidden_size,
-        )
+
+        if self.use_dynamic_fc_graph:
+            self.feature_blocks = DynamicFunctionalGraphDecoder(
+                num_nodes=feature_size,
+                hidden_size=hidden_size,
+                n_layers=n_decoder,
+                mlp_ratio=mlp_ratio,
+                graph_heads=graph_heads,
+                graph_topk=graph_topk,
+                graph_rank=graph_rank,
+                graph_residual_init=graph_residual_init,
+                use_raw_correlation=use_raw_correlation,
+                diffusion_steps=diffusion_steps,
+            )
+        else:
+            self.feature_encoder = Encoder(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                n_layers=n_encoder,
+                mlp_ratio=mlp_ratio,
+                d_state=d_state,
+                d_conv=d_conv,
+            )
+            self.feature_blocks = Decoder_M(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                n_layers=n_decoder,
+                d_state=d_state,
+                d_conv=d_conv,
+            )
+            self.feature_graph_mixer = AdaptiveFunctionalGraphMixer(
+                num_nodes=feature_size,
+                hidden_size=hidden_size,
+            )
 
         self.fc_time = nn.Linear(hidden_size, input_shape[1])
         self.fc_feature = nn.Linear(hidden_size, input_shape[0])
@@ -509,13 +728,19 @@ class DiM(nn.Module):
         x_time = self.fc_time(x_time)
 
         if self.trans_mx is None:
-            x_feature = self.feature2emb(x)
+            graph_input = x
         else:
-            x_feature = self.feature2emb(torch.matmul(self.trans_mx, x.permute(0, 2, 1)).permute(0, 2, 1))
+            graph_input = torch.matmul(self.trans_mx, x.permute(0, 2, 1)).permute(0, 2, 1)
 
-        x_feature = self.feature_encoder(x_feature)
-        x_feature = self.feature_graph_mixer(x_feature, t)
-        x_feature, x0, dt, A, B, C, bias = self.feature_blocks(x_feature, t)
+        x_feature = self.feature2emb(graph_input)
+        if self.use_dynamic_fc_graph:
+            # 动态功能图只在 feature branch 中混合 ROI，time branch 仍负责 BOLD 时间动态建模。
+            x_feature, a_dyn, roi_context, graph_context = self.feature_blocks(x_feature, graph_input, t)
+        else:
+            x_feature = self.feature_encoder(x_feature)
+            x_feature = self.feature_graph_mixer(x_feature, t)
+            x_feature, x0, dt, A, B, C, bias = self.feature_blocks(x_feature, t)
+            graph_context = None
         x_feature = self.fc_feature(x_feature)
 
         if self.trans_mx is None:
@@ -523,5 +748,11 @@ class DiM(nn.Module):
         else:
             x_feature = torch.matmul(torch.linalg.inv(self.trans_mx), x_feature)
             x_feature = x_feature.permute(0, 2, 1)
+
+        if self.use_dynamic_fc_graph and self.use_graph_conditioned_fusion:
+            # 用动态图的全局状态控制 ROI 级 feature 分支强度，避免图分支在所有脑区上无差别相加。
+            fusion_context = self.branch_fusion_emb(t) + graph_context
+            fusion_gate = self.branch_fusion_gate(fusion_context).unsqueeze(1)
+            return x_time + fusion_gate * x_feature
 
         return x_feature + x_time
