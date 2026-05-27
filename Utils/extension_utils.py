@@ -130,6 +130,143 @@ def compute_extension_metrics(history_raw, extension_raw, compare_len=None):
     return metrics
 
 
+def compute_groundtruth_extension_metrics(history_raw, generated_future_raw, true_future_raw):
+    if history_raw.ndim != 2 or generated_future_raw.ndim != 2 or true_future_raw.ndim != 2:
+        raise ValueError('history_raw, generated_future_raw and true_future_raw must be 2D arrays shaped [time, feature_dim].')
+    if generated_future_raw.shape != true_future_raw.shape:
+        raise ValueError(
+            f'generated_future_raw and true_future_raw must have the same shape, '
+            f'got {generated_future_raw.shape} and {true_future_raw.shape}.'
+        )
+    if history_raw.shape[1] != generated_future_raw.shape[1]:
+        raise ValueError('history and future arrays must have the same feature dimension.')
+
+    err = generated_future_raw - true_future_raw
+    seam_diff = generated_future_raw[0, :] - history_raw[-1, :]
+
+    # 这里是真实未来段可用的评估：直接比较生成未来和隐藏的 Rest1 未来真值。
+    metrics = {
+        'future_len': int(generated_future_raw.shape[0]),
+        'mae': float(np.mean(np.abs(err))),
+        'mse': float(np.mean(err ** 2)),
+        'rmse': float(np.sqrt(np.mean(err ** 2))),
+        'future_mean_shift_mae': float(np.mean(np.abs(
+            generated_future_raw.mean(axis=0) - true_future_raw.mean(axis=0)
+        ))),
+        'future_std_shift_mae': float(np.mean(np.abs(
+            generated_future_raw.std(axis=0) - true_future_raw.std(axis=0)
+        ))),
+        'fc_upper_corr': _safe_corrcoef(
+            _connectivity_upper(true_future_raw),
+            _connectivity_upper(generated_future_raw),
+        ),
+        'psd_l1': float(np.mean(np.abs(
+            _normalized_psd(true_future_raw) - _normalized_psd(generated_future_raw)
+        ))),
+        'seam_mae': float(np.mean(np.abs(seam_diff))),
+        'seam_rmse': float(np.sqrt(np.mean(seam_diff ** 2))),
+    }
+    return metrics
+
+
+def fc_upper_vector(sequence):
+    if sequence.ndim != 2:
+        raise ValueError('sequence must be a 2D array shaped [time, feature_dim].')
+    # 动态 FC 比较只使用相关矩阵上三角，避免对角线恒为 1 影响相似性。
+    return _connectivity_upper(sequence)
+
+
+def _window_starts(length, window, stride):
+    if window <= 0:
+        raise ValueError('window must be positive.')
+    if stride <= 0:
+        raise ValueError('stride must be positive.')
+    if length < window:
+        return []
+    return list(range(0, length - window + 1, stride))
+
+
+def compute_dynamic_fc_similarity(
+    history_raw,
+    generated_future_raw,
+    true_future_raw,
+    window=128,
+    stride=32,
+    future_stride=None,
+):
+    if history_raw.ndim != 2 or generated_future_raw.ndim != 2 or true_future_raw.ndim != 2:
+        raise ValueError('history_raw, generated_future_raw and true_future_raw must be 2D arrays shaped [time, feature_dim].')
+    if generated_future_raw.shape != true_future_raw.shape:
+        raise ValueError(
+            f'generated_future_raw and true_future_raw must have the same shape, '
+            f'got {generated_future_raw.shape} and {true_future_raw.shape}.'
+        )
+    if future_stride is None:
+        future_stride = window
+
+    history_starts = _window_starts(history_raw.shape[0], window, stride)
+    future_starts = _window_starts(generated_future_raw.shape[0], window, future_stride)
+    if len(history_starts) == 0:
+        raise ValueError('history_raw is shorter than the dynamic FC window.')
+    if len(future_starts) == 0:
+        raise ValueError('future arrays are shorter than the dynamic FC window.')
+
+    # 历史段用滑窗形成 subject-specific dynamic FC repertoire。
+    history_vectors = [
+        fc_upper_vector(history_raw[start:start + window, :])
+        for start in history_starts
+    ]
+    records = []
+    gen_trajectories = []
+    true_trajectories = []
+
+    for future_idx, future_start in enumerate(future_starts):
+        gen_vec = fc_upper_vector(generated_future_raw[future_start:future_start + window, :])
+        true_vec = fc_upper_vector(true_future_raw[future_start:future_start + window, :])
+        gen_corrs = []
+        true_corrs = []
+
+        for hist_idx, (hist_start, hist_vec) in enumerate(zip(history_starts, history_vectors)):
+            gen_corr = _safe_corrcoef(gen_vec, hist_vec)
+            true_corr = _safe_corrcoef(true_vec, hist_vec)
+            gen_corrs.append(gen_corr)
+            true_corrs.append(true_corr)
+            records.append({
+                'future_window_idx': int(future_idx),
+                'future_start': int(future_start),
+                'history_window_idx': int(hist_idx),
+                'history_start': int(hist_start),
+                'history_center': float(hist_start + window / 2.0),
+                'gen_hist_fc_corr': gen_corr,
+                'true_hist_fc_corr': true_corr,
+            })
+
+        gen_trajectories.append(gen_corrs)
+        true_trajectories.append(true_corrs)
+
+    gen_trajectories = np.asarray(gen_trajectories, dtype=np.float32)
+    true_trajectories = np.asarray(true_trajectories, dtype=np.float32)
+    gen_argmax = np.argmax(gen_trajectories, axis=1)
+    true_argmax = np.argmax(true_trajectories, axis=1)
+    trajectory_corrs = [
+        _safe_corrcoef(gen_row, true_row)
+        for gen_row, true_row in zip(gen_trajectories, true_trajectories)
+    ]
+
+    summary = {
+        'dynamic_num_history_windows': int(len(history_starts)),
+        'dynamic_num_future_windows': int(len(future_starts)),
+        'gen_max_hist_fc_corr': float(np.mean(np.max(gen_trajectories, axis=1))),
+        'gen_last_hist_fc_corr': float(np.mean(gen_trajectories[:, -1])),
+        'true_max_hist_fc_corr': float(np.mean(np.max(true_trajectories, axis=1))),
+        'true_last_hist_fc_corr': float(np.mean(true_trajectories[:, -1])),
+        'gen_true_trajectory_corr': float(np.mean(trajectory_corrs)),
+        # 该值表示生成未来和真实未来是否最像同一个历史 FC 窗口，用于描述动态 FC 状态匹配。
+        'gen_true_best_window_match': float(np.mean(gen_argmax == true_argmax)),
+    }
+    return records, summary
+
+
 def compute_prediction_metrics(pred, gt, pred_len, eps=1e-8):
     pred = np.asarray(pred)
     gt = np.asarray(gt)

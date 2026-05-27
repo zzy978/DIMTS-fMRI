@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=partition_1
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=DFCGraph_MMDablate_seq256_pred
+#SBATCH --job-name=DFCGraph_MMDenhanced_seq256_pred
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -68,12 +68,12 @@ if [ "${EXPERIMENT_GROUP}" = "phase_a" ]; then
 elif [ "${EXPERIMENT_GROUP}" = "phase_b" ]; then
   # Phase B：与训练脚本保持一致。
   LAMBDA1S=(0.3 1.0 0.3 0.1 0.1)
-  LAMBDA2S=(0 0 0 0 0)
+  LAMBDA2S=(0.01 0.01 0.03 0.03 0.1)
 
   LAMBDA1="${LAMBDA1S[$ARRAY_ID]}"
   LAMBDA2="${LAMBDA2S[$ARRAY_ID]}"
   EXP_IDX=$((ARRAY_ID + 1))
-  EXP_NAME="fmri_seq256_zscore_DFCGraph_MMDablate_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
+  EXP_NAME="fmri_seq256_zscore_DFCGraph_MMDenhanced_stride${STRIDE}_subj${BEST_SUBJECTS}_lambda${EXP_IDX}"
   CHECKPOINT_NAME="${EXP_NAME}"
 
   "${PYTHON_BIN}" main.py \
