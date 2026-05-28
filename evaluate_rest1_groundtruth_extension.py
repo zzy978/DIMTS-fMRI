@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument('--fc_stride', type=int, default=32)
     parser.add_argument('--max_subjects', type=int, default=0, help='Use only the first N sorted subjects for smoke tests. <=0 uses all.')
     parser.add_argument('--num_plot_subjects', type=int, default=3, help='Number of sorted subjects to use for example figures.')
+    parser.add_argument('--skip_dynamic_fc', action='store_true', help='Skip dynamic FC trajectory CSV and summary metrics.')
+    parser.add_argument('--skip_sliding_windows', action='store_true', help='Skip Rest1 sliding-window prediction outputs.')
     parser.add_argument('--tensorboard', action='store_true')
     parser.add_argument('opts', default=None, nargs=argparse.REMAINDER, help='Optional config overrides.')
     args = parser.parse_args()
@@ -347,7 +349,7 @@ def summarize_by_length(tail_df):
     metric_cols = [
         'mae', 'mse', 'rmse', 'future_mean_shift_mae', 'future_std_shift_mae',
         'mae_z', 'mse_z', 'rmse_z',
-        'fc_upper_corr', 'psd_l1', 'seam_mae', 'seam_rmse',
+        'fc_upper_corr', 'fc_abs_diff', 'psd_l1', 'seam_mae', 'seam_rmse',
         'gen_max_hist_fc_corr', 'gen_last_hist_fc_corr',
         'true_max_hist_fc_corr', 'true_last_hist_fc_corr',
         'gen_true_trajectory_corr', 'gen_true_best_window_match',
@@ -439,14 +441,17 @@ def process_tail_holdout(args, trainer, config, subject_files, output_dir, plots
                     generated_future_norm=generated_norm,
                     true_future_norm=record['true_future_norm'],
                 ))
-                dynamic_records, dynamic_summary = compute_dynamic_fc_similarity(
-                    history_raw=record['history_raw'],
-                    generated_future_raw=generated_future_raw,
-                    true_future_raw=record['true_future_raw'],
-                    window=args.fc_window,
-                    stride=args.fc_stride,
-                    future_stride=args.fc_window,
-                )
+                dynamic_records = []
+                dynamic_summary = {}
+                if not args.skip_dynamic_fc:
+                    dynamic_records, dynamic_summary = compute_dynamic_fc_similarity(
+                        history_raw=record['history_raw'],
+                        generated_future_raw=generated_future_raw,
+                        true_future_raw=record['true_future_raw'],
+                        window=args.fc_window,
+                        stride=args.fc_stride,
+                        future_stride=args.fc_window,
+                    )
 
                 row = {
                     'subject_id': record['subject_id'],
@@ -491,7 +496,8 @@ def process_tail_holdout(args, trainer, config, subject_files, output_dir, plots
     tail_df = pd.DataFrame(tail_rows)
     dynamic_df = pd.DataFrame(dynamic_rows)
     tail_df.to_csv(output_dir / 'tail_holdout_summary.csv', index=False)
-    dynamic_df.to_csv(output_dir / 'dynamic_fc_similarity.csv', index=False)
+    if not args.skip_dynamic_fc:
+        dynamic_df.to_csv(output_dir / 'dynamic_fc_similarity.csv', index=False)
 
     metrics_by_length = summarize_by_length(tail_df)
     metrics_by_length.to_csv(output_dir / 'metrics_by_length.csv', index=False)
@@ -557,7 +563,7 @@ def process_sliding_windows(args, trainer, config, subject_files, output_dir):
     metric_cols = [
         'mae', 'mse', 'rmse', 'future_mean_shift_mae', 'future_std_shift_mae',
         'mae_z', 'mse_z', 'rmse_z',
-        'fc_upper_corr', 'psd_l1', 'seam_mae', 'seam_rmse',
+        'fc_upper_corr', 'fc_abs_diff', 'psd_l1', 'seam_mae', 'seam_rmse',
     ]
     subject_summary = sliding_df.groupby('subject_id')[metric_cols].mean().reset_index()
     subject_summary.insert(1, 'num_windows', sliding_df.groupby('subject_id').size().values)
@@ -575,6 +581,8 @@ def save_manifest(args, trainer, subject_files, output_dir):
         'normalization': Z_SCORE_NORMALIZATION,
         'normalization_fit': 'full_subject_sequence',
         'zscore_error_metrics': ['mae_z', 'mse_z', 'rmse_z'],
+        'skip_dynamic_fc': args.skip_dynamic_fc,
+        'skip_sliding_windows': args.skip_sliding_windows,
         'pred_len': args.pred_len,
         'extend_lengths': args.extend_lengths,
         'stride': args.stride,
@@ -607,13 +615,17 @@ def main():
         output_dir=output_dir,
         plots_dir=plots_dir,
     )
-    sliding_df, sliding_subject_df = process_sliding_windows(
-        args=args,
-        trainer=trainer,
-        config=config,
-        subject_files=subject_files,
-        output_dir=output_dir,
-    )
+    if args.skip_sliding_windows:
+        sliding_df = pd.DataFrame()
+        sliding_subject_df = pd.DataFrame()
+    else:
+        sliding_df, sliding_subject_df = process_sliding_windows(
+            args=args,
+            trainer=trainer,
+            config=config,
+            subject_files=subject_files,
+            output_dir=output_dir,
+        )
     save_manifest(args, trainer, subject_files, output_dir)
 
     logger.log_info(

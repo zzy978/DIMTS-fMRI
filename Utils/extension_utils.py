@@ -145,6 +145,9 @@ def compute_groundtruth_extension_metrics(history_raw, generated_future_raw, tru
     seam_diff = generated_future_raw[0, :] - history_raw[-1, :]
 
     # 这里是真实未来段可用的评估：直接比较生成未来和隐藏的 Rest1 未来真值。
+    true_fc = _connectivity_upper(true_future_raw)
+    generated_fc = _connectivity_upper(generated_future_raw)
+
     metrics = {
         'future_len': int(generated_future_raw.shape[0]),
         'mae': float(np.mean(np.abs(err))),
@@ -156,10 +159,9 @@ def compute_groundtruth_extension_metrics(history_raw, generated_future_raw, tru
         'future_std_shift_mae': float(np.mean(np.abs(
             generated_future_raw.std(axis=0) - true_future_raw.std(axis=0)
         ))),
-        'fc_upper_corr': _safe_corrcoef(
-            _connectivity_upper(true_future_raw),
-            _connectivity_upper(generated_future_raw),
-        ),
+        'fc_upper_corr': _safe_corrcoef(true_fc, generated_fc),
+        # FC 平均绝对差用于直接衡量生成 FC 和真实未来 FC 在 ROI-pair 连接强度上的偏差。
+        'fc_abs_diff': float(np.mean(np.abs(generated_fc - true_fc))),
         'psd_l1': float(np.mean(np.abs(
             _normalized_psd(true_future_raw) - _normalized_psd(generated_future_raw)
         ))),
