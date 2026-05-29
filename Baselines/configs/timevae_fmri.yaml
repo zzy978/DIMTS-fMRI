@@ -1,0 +1,33 @@
+baseline:
+  name: timevae
+  seq_length: 256
+  context_len: 128
+  pred_len: 128
+  feature_size: 219
+  hidden_dim: 128
+  latent_dim: 64
+  kl_weight: 0.001
+training:
+  checkpoint_dir: Checkpoints_baselines_zscore/timevae_seq256_ctx128_pred128
+  max_steps: 10000
+  save_every: 1000
+  log_every: 100
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_workers: 0
+data:
+  train_data_root: /data/home/zyzeng/data1/datasets/hcp_2400time_csv
+  stride: 64
+  seed: 123
+  max_subjects: 1000
+  subject_train_ratio: 0.8
+  subject_val_ratio: 0.1
+  subject_test_ratio: 0.1
+  subject_shuffle: true
+  drop_nan_subjects: true
+evaluation:
+  eval_source: test_split
+  source_dir: /data/home/zyzeng/data1/datasets/rest1_to_csv_500
+  extend_lengths: [128, 256, 384, 512]

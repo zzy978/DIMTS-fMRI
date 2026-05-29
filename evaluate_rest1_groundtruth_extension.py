@@ -132,7 +132,19 @@ def compute_zscore_error_metrics(generated_future_norm, true_future_norm):
         )
     # z-score 指标保留在模型实际生成空间中，便于跨 subject 比较误差大小。
     err = generated_future_norm - true_future_norm
+    gen_flat = generated_future_norm.reshape(-1)
+    true_flat = true_future_norm.reshape(-1)
+    gen_std = np.std(gen_flat)
+    true_std = np.std(true_flat)
+    if gen_std < 1e-12 or true_std < 1e-12:
+        corr_z = 0.0
+    else:
+        corr_z = float(np.corrcoef(true_flat, gen_flat)[0, 1])
+        if np.isnan(corr_z):
+            corr_z = 0.0
     return {
+        # corr_z 展平 [time, ROI] 后计算，用于和 baseline 主表的整体未来波形相关性对齐。
+        'corr_z': corr_z,
         'mae_z': float(np.mean(np.abs(err))),
         'mse_z': float(np.mean(err ** 2)),
         'rmse_z': float(np.sqrt(np.mean(err ** 2))),
@@ -348,7 +360,7 @@ def plot_metrics_by_length(summary_df, output_path):
 def summarize_by_length(tail_df):
     metric_cols = [
         'mae', 'mse', 'rmse', 'future_mean_shift_mae', 'future_std_shift_mae',
-        'mae_z', 'mse_z', 'rmse_z',
+        'corr_z', 'mae_z', 'mse_z', 'rmse_z',
         'fc_upper_corr', 'fc_abs_diff', 'psd_l1', 'seam_mae', 'seam_rmse',
         'gen_max_hist_fc_corr', 'gen_last_hist_fc_corr',
         'true_max_hist_fc_corr', 'true_last_hist_fc_corr',
